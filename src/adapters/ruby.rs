@@ -84,6 +84,7 @@ impl RubyAdapter {
         args: &[String],
         cwd: Option<&str>,
         stop_on_entry: bool,
+        env: &std::collections::HashMap<String, String>,
     ) -> Value {
         let mut launch = json!({
             "request": "launch",
@@ -97,6 +98,10 @@ impl RubyAdapter {
 
         if let Some(cwd_path) = cwd {
             launch["cwd"] = json!(cwd_path);
+        }
+
+        if !env.is_empty() {
+            launch["env"] = json!(env);
         }
 
         launch
@@ -220,7 +225,13 @@ mod tests {
     fn test_launch_args_without_cwd() {
         let program = "/path/to/script.rb";
         let args = vec!["arg1".to_string(), "arg2".to_string()];
-        let launch = RubyAdapter::launch_args_with_options(program, &args, None, true);
+        let launch = RubyAdapter::launch_args_with_options(
+            program,
+            &args,
+            None,
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["request"], "launch");
         assert_eq!(launch["type"], "ruby");
@@ -236,7 +247,13 @@ mod tests {
         let program = "/path/to/script.rb";
         let args = vec!["arg1".to_string()];
         let cwd = Some("/working/dir");
-        let launch = RubyAdapter::launch_args_with_options(program, &args, cwd, false);
+        let launch = RubyAdapter::launch_args_with_options(
+            program,
+            &args,
+            cwd,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["cwd"], "/working/dir");
         assert_eq!(launch["program"], program);
@@ -247,7 +264,13 @@ mod tests {
     fn test_launch_args_empty_args() {
         let program = "test.rb";
         let args = Vec::<String>::new();
-        let launch = RubyAdapter::launch_args_with_options(program, &args, None, true);
+        let launch = RubyAdapter::launch_args_with_options(
+            program,
+            &args,
+            None,
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["args"], json!([]));
     }

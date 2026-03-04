@@ -195,7 +195,13 @@ fn test_ruby_adapter_launch_args() {
     let args = vec!["100".to_string()];
     let cwd = Some("/workspace");
 
-    let launch_args = RubyAdapter::launch_args_with_options(program, &args, cwd, true);
+    let launch_args = RubyAdapter::launch_args_with_options(
+        program,
+        &args,
+        cwd,
+        true,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["request"], "launch");
     assert_eq!(launch_args["type"], "ruby");

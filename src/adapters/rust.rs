@@ -700,6 +700,7 @@ impl RustAdapter {
         args: &[String],
         cwd: Option<&str>,
         stop_on_entry: bool,
+        env: &std::collections::HashMap<String, String>,
     ) -> Value {
         let mut launch = json!({
             "type": "lldb",
@@ -734,6 +735,10 @@ impl RustAdapter {
             // Default to /workspace (common in Docker/CI environments)
             // This matches the compilation directory embedded in DWARF debug info
             launch["cwd"] = json!("/workspace");
+        }
+
+        if !env.is_empty() {
+            launch["env"] = json!(env);
         }
 
         launch
@@ -883,7 +888,13 @@ mod tests {
     fn test_launch_args_basic() {
         let binary = "/workspace/target/debug/fizzbuzz";
         let args = vec![];
-        let config = RustAdapter::launch_args(binary, &args, None, false);
+        let config = RustAdapter::launch_args(
+            binary,
+            &args,
+            None,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["type"], "lldb");
         assert_eq!(config["request"], "launch");
@@ -898,7 +909,13 @@ mod tests {
     fn test_launch_args_with_stop_on_entry() {
         let binary = "/workspace/target/debug/app";
         let args = vec!["--verbose".to_string()];
-        let config = RustAdapter::launch_args(binary, &args, Some("/workspace"), true);
+        let config = RustAdapter::launch_args(
+            binary,
+            &args,
+            Some("/workspace"),
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["program"], binary);
         assert_eq!(config["args"], json!(["--verbose"]));
@@ -914,7 +931,13 @@ mod tests {
             "config.toml".to_string(),
             "--verbose".to_string(),
         ];
-        let config = RustAdapter::launch_args(binary, &args, None, false);
+        let config = RustAdapter::launch_args(
+            binary,
+            &args,
+            None,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["args"], json!(args));
     }
@@ -923,7 +946,13 @@ mod tests {
     fn test_launch_args_includes_init_commands() {
         let binary = "/workspace/target/debug/fizzbuzz";
         let args = vec![];
-        let config = RustAdapter::launch_args(binary, &args, None, false);
+        let config = RustAdapter::launch_args(
+            binary,
+            &args,
+            None,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         // initCommands should be present (may be empty if rustc not installed)
         assert!(config["initCommands"].is_array());
@@ -946,6 +975,16 @@ mod tests {
                 "Init commands should enable the Rust category"
             );
         }
+    }
+
+    #[test]
+    fn test_launch_args_with_env() {
+        let binary = "/workspace/target/debug/app";
+        let args = vec![];
+        let env = std::collections::HashMap::from([("RUST_LOG".to_string(), "trace".to_string())]);
+        let config = RustAdapter::launch_args(binary, &args, None, false, &env);
+
+        assert_eq!(config["env"]["RUST_LOG"], "trace");
     }
 
     // Compilation tests require rustc installed

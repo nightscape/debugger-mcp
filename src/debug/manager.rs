@@ -37,6 +37,7 @@ impl SessionManager {
         args: Vec<String>,
         cwd: Option<String>,
         stop_on_entry: bool,
+        env: std::collections::HashMap<String, String>,
     ) -> Result<String> {
         // Type alias for STDIO adapter tuple: (command, args, adapter_id, launch_args, adapter_for_logging)
         type StdioAdapterTuple<'a> = (
@@ -64,6 +65,7 @@ impl SessionManager {
                         &args,
                         cwd.as_deref(),
                         stop_on_entry,
+                        &env,
                     );
 
                     // Log transport initialization
@@ -105,6 +107,7 @@ impl SessionManager {
                         &args,
                         cwd.as_deref(),
                         stop_on_entry,
+                        &env,
                     );
 
                     // Create DAP client from socket
@@ -164,6 +167,7 @@ impl SessionManager {
                         &args,
                         cwd.as_deref(),
                         stop_on_entry,
+                        &env,
                     );
 
                     // Create DAP client from socket (parent session)
@@ -264,6 +268,7 @@ impl SessionManager {
                         &args,
                         cwd.as_deref(),
                         stop_on_entry,
+                        &env,
                     );
 
                     // Create DAP client from socket
@@ -345,6 +350,7 @@ impl SessionManager {
                         &args,
                         cwd.as_deref(),
                         stop_on_entry,
+                        &env,
                     );
 
                     // Create DAP client from socket (like Ruby/Go)
@@ -499,7 +505,14 @@ mod tests {
         let manager = SessionManager::new();
         // Use a truly unsupported language (ruby is now supported!)
         let result = manager
-            .create_session("javascript", "test.js".to_string(), vec![], None, false)
+            .create_session(
+                "javascript",
+                "test.js".to_string(),
+                vec![],
+                None,
+                false,
+                std::collections::HashMap::new(),
+            )
             .await;
 
         assert!(result.is_err());

@@ -52,7 +52,13 @@ fn test_rust_launch_args_structure() {
     let binary_path = "/workspace/fizzbuzz-rust-test/target/debug/fizzbuzz";
     let program_args = vec!["100".to_string()];
     let cwd = Some("/workspace/fizzbuzz-rust-test");
-    let launch_args = RustAdapter::launch_args(binary_path, &program_args, cwd, true);
+    let launch_args = RustAdapter::launch_args(
+        binary_path,
+        &program_args,
+        cwd,
+        true,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["request"], "launch");
     assert_eq!(launch_args["type"], "lldb");
@@ -70,7 +76,13 @@ fn test_rust_launch_args_structure() {
 fn test_rust_launch_args_no_cwd() {
     let binary_path = "/workspace/target/debug/test";
     let program_args = Vec::<String>::new();
-    let launch_args = RustAdapter::launch_args(binary_path, &program_args, None, false);
+    let launch_args = RustAdapter::launch_args(
+        binary_path,
+        &program_args,
+        None,
+        false,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["program"], binary_path);
     assert_eq!(launch_args["stopOnEntry"], false);
@@ -82,7 +94,13 @@ fn test_rust_launch_args_no_cwd() {
 #[test]
 fn test_rust_launch_args_no_stop_on_entry() {
     let binary_path = "/workspace/target/debug/app";
-    let launch_args = RustAdapter::launch_args(binary_path, &[], None, false);
+    let launch_args = RustAdapter::launch_args(
+        binary_path,
+        &[],
+        None,
+        false,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(
         launch_args["stopOnEntry"], false,

@@ -25,7 +25,7 @@ impl PythonAdapter {
     }
 
     pub fn launch_args(program: &str, args: &[String], cwd: Option<&str>) -> Value {
-        Self::launch_args_with_options(program, args, cwd, false)
+        Self::launch_args_with_options(program, args, cwd, false, &std::collections::HashMap::new())
     }
 
     pub fn launch_args_with_options(
@@ -33,6 +33,7 @@ impl PythonAdapter {
         args: &[String],
         cwd: Option<&str>,
         stop_on_entry: bool,
+        env: &std::collections::HashMap<String, String>,
     ) -> Value {
         let mut launch = json!({
             "request": "launch",
@@ -49,6 +50,10 @@ impl PythonAdapter {
 
         if let Some(cwd_path) = cwd {
             launch["cwd"] = json!(cwd_path);
+        }
+
+        if !env.is_empty() {
+            launch["env"] = json!(env);
         }
 
         launch
@@ -185,5 +190,29 @@ mod tests {
         let launch = PythonAdapter::launch_args(program, &args, None);
 
         assert_eq!(launch["args"], json!([]));
+    }
+
+    #[test]
+    fn test_launch_args_with_env() {
+        let program = "test.py";
+        let args = vec![];
+        let env = std::collections::HashMap::from([
+            ("LOG_LEVEL".to_string(), "debug".to_string()),
+            ("DB_HOST".to_string(), "localhost".to_string()),
+        ]);
+        let launch = PythonAdapter::launch_args_with_options(program, &args, None, false, &env);
+
+        assert_eq!(launch["env"]["LOG_LEVEL"], "debug");
+        assert_eq!(launch["env"]["DB_HOST"], "localhost");
+    }
+
+    #[test]
+    fn test_launch_args_without_env() {
+        let program = "test.py";
+        let args = vec![];
+        let env = std::collections::HashMap::new();
+        let launch = PythonAdapter::launch_args_with_options(program, &args, None, false, &env);
+
+        assert!(launch["env"].is_null());
     }
 }

@@ -3,6 +3,7 @@ use crate::debug::SessionManager;
 use crate::{Error, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -16,6 +17,8 @@ pub struct DebuggerStartArgs {
     pub cwd: Option<String>,
     #[serde(default)]
     pub stop_on_entry: bool,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +173,7 @@ impl ToolsHandler {
                 args.args,
                 validated_cwd,
                 args.stop_on_entry,
+                args.env,
             )
             .await?;
 
@@ -487,6 +491,11 @@ impl ToolsHandler {
                         "stopOnEntry": {
                             "type": "boolean",
                             "description": "If true, pauses execution at the program's first line (recommended for setting early breakpoints)"
+                        },
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "description": "Environment variables to set for the debugged program (optional, e.g., {\"LOG_LEVEL\": \"debug\"})"
                         }
                     },
                     "required": ["language", "program"]
@@ -882,6 +891,14 @@ mod tests {
         assert!(start_tool["inputSchema"]["type"].is_string());
         assert!(start_tool["inputSchema"]["properties"].is_object());
         assert!(start_tool["inputSchema"]["required"].is_array());
+
+        // Verify env property exists in schema
+        let properties = &start_tool["inputSchema"]["properties"];
+        assert!(
+            properties["env"].is_object(),
+            "env property should exist in debugger_start schema"
+        );
+        assert_eq!(properties["env"]["type"], "object");
     }
 
     #[tokio::test]

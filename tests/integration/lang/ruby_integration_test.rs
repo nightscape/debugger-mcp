@@ -102,6 +102,7 @@ async fn test_ruby_language_detection() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -128,6 +129,7 @@ async fn test_ruby_adapter_spawning() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await
         .expect("Should create Ruby session");

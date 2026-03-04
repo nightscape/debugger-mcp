@@ -111,6 +111,7 @@ impl GoAdapter {
         args: &[String],
         cwd: Option<&str>,
         stop_on_entry: bool,
+        env: &std::collections::HashMap<String, String>,
     ) -> Value {
         let mut launch = json!({
             "request": "launch",
@@ -123,6 +124,10 @@ impl GoAdapter {
 
         if let Some(cwd_path) = cwd {
             launch["cwd"] = json!(cwd_path);
+        }
+
+        if !env.is_empty() {
+            launch["env"] = json!(env);
         }
 
         launch
@@ -259,7 +264,13 @@ mod tests {
     fn test_launch_args_without_cwd() {
         let program = "/path/to/main.go";
         let args = vec!["arg1".to_string(), "arg2".to_string()];
-        let launch = GoAdapter::launch_args_with_options(program, &args, None, true);
+        let launch = GoAdapter::launch_args_with_options(
+            program,
+            &args,
+            None,
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["request"], "launch");
         assert_eq!(launch["type"], "go");
@@ -275,7 +286,13 @@ mod tests {
         let program = "/path/to/package/";
         let args = vec!["arg1".to_string()];
         let cwd = Some("/working/dir");
-        let launch = GoAdapter::launch_args_with_options(program, &args, cwd, false);
+        let launch = GoAdapter::launch_args_with_options(
+            program,
+            &args,
+            cwd,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["cwd"], "/working/dir");
         assert_eq!(launch["program"], program);
@@ -286,7 +303,13 @@ mod tests {
     fn test_launch_args_empty_args() {
         let program = "test.go";
         let args = Vec::<String>::new();
-        let launch = GoAdapter::launch_args_with_options(program, &args, None, true);
+        let launch = GoAdapter::launch_args_with_options(
+            program,
+            &args,
+            None,
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["args"], json!([]));
     }
@@ -296,7 +319,13 @@ mod tests {
         // Test that package directory works (multi-file support)
         let program = "/path/to/mypackage/";
         let args = Vec::<String>::new();
-        let launch = GoAdapter::launch_args_with_options(program, &args, None, false);
+        let launch = GoAdapter::launch_args_with_options(
+            program,
+            &args,
+            None,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(launch["program"], "/path/to/mypackage/");
         assert_eq!(launch["mode"], "debug");

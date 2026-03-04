@@ -209,6 +209,7 @@ impl NodeJsAdapter {
         args: &[String],
         cwd: Option<&str>,
         stop_on_entry: bool,
+        env: &std::collections::HashMap<String, String>,
     ) -> Value {
         let mut launch = json!({
             "type": "pwa-node",
@@ -222,6 +223,10 @@ impl NodeJsAdapter {
 
         if let Some(cwd_path) = cwd {
             launch["cwd"] = json!(cwd_path);
+        }
+
+        if !env.is_empty() {
+            launch["env"] = json!(env);
         }
 
         launch
@@ -382,7 +387,13 @@ mod tests {
         let program = "/workspace/fizzbuzz.js";
         let args = vec!["100".to_string()];
         let cwd = Some("/workspace");
-        let config = NodeJsAdapter::launch_config(program, &args, cwd, true);
+        let config = NodeJsAdapter::launch_config(
+            program,
+            &args,
+            cwd,
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["type"], "pwa-node");
         assert_eq!(config["request"], "launch");
@@ -397,7 +408,13 @@ mod tests {
     fn test_launch_config_without_stop_on_entry() {
         let program = "/app/server.js";
         let args = Vec::<String>::new();
-        let config = NodeJsAdapter::launch_config(program, &args, None, false);
+        let config = NodeJsAdapter::launch_config(
+            program,
+            &args,
+            None,
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["type"], "pwa-node");
         assert_eq!(config["stopOnEntry"], false);
@@ -413,7 +430,13 @@ mod tests {
             "--output".to_string(),
             "result.json".to_string(),
         ];
-        let config = NodeJsAdapter::launch_config(program, &args, Some("/app"), false);
+        let config = NodeJsAdapter::launch_config(
+            program,
+            &args,
+            Some("/app"),
+            false,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["args"], json!(args));
         assert_eq!(config["args"][0], "--verbose");
@@ -425,7 +448,13 @@ mod tests {
     fn test_launch_config_empty_args() {
         let program = "test.js";
         let args = Vec::<String>::new();
-        let config = NodeJsAdapter::launch_config(program, &args, None, true);
+        let config = NodeJsAdapter::launch_config(
+            program,
+            &args,
+            None,
+            true,
+            &std::collections::HashMap::new(),
+        );
 
         assert_eq!(config["args"], json!([]));
     }

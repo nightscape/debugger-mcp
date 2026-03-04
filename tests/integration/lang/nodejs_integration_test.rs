@@ -102,6 +102,7 @@ async fn test_nodejs_language_detection() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -127,6 +128,7 @@ async fn test_nodejs_adapter_spawning() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await
         .expect("Should create Node.js session");

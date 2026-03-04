@@ -111,6 +111,7 @@ async fn test_go_language_detection() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -145,6 +146,7 @@ async fn test_go_adapter_spawning() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await
         .expect("Should create Go session");

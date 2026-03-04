@@ -191,6 +191,7 @@ async fn test_rust_language_detection() {
             vec![],
             None,
             true,
+            std::collections::HashMap::new(),
         )
         .await;
 
@@ -245,7 +246,14 @@ async fn test_rust_adapter_spawning() {
 
     // Create a Rust debug session
     let session_id = session_manager
-        .create_session("rust", binary_str.clone(), vec![], None, true)
+        .create_session(
+            "rust",
+            binary_str.clone(),
+            vec![],
+            None,
+            true,
+            std::collections::HashMap::new(),
+        )
         .await
         .expect("Should create Rust session");
 

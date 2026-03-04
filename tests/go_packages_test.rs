@@ -31,7 +31,13 @@ fn test_go_launch_args_single_file() {
     let program = "/workspace/fizzbuzz.go";
     let program_args = vec!["100".to_string()];
     let cwd = Some("/workspace");
-    let launch_args = GoAdapter::launch_args_with_options(program, &program_args, cwd, true);
+    let launch_args = GoAdapter::launch_args_with_options(
+        program,
+        &program_args,
+        cwd,
+        true,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["request"], "launch");
     assert_eq!(launch_args["type"], "go");
@@ -47,7 +53,13 @@ fn test_go_launch_args_single_file() {
 fn test_go_launch_args_package_directory() {
     let program = "/workspace/mypackage/"; // Directory, not file
     let program_args = Vec::<String>::new();
-    let launch_args = GoAdapter::launch_args_with_options(program, &program_args, None, false);
+    let launch_args = GoAdapter::launch_args_with_options(
+        program,
+        &program_args,
+        None,
+        false,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["program"], "/workspace/mypackage/");
     assert_eq!(launch_args["mode"], "debug");
@@ -61,7 +73,13 @@ fn test_go_launch_args_module() {
     let program = "/workspace/mymodule/"; // Directory with go.mod
     let program_args = vec!["--verbose".to_string()];
     let cwd = Some("/workspace/mymodule");
-    let launch_args = GoAdapter::launch_args_with_options(program, &program_args, cwd, true);
+    let launch_args = GoAdapter::launch_args_with_options(
+        program,
+        &program_args,
+        cwd,
+        true,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["program"], "/workspace/mymodule/");
     assert_eq!(launch_args["args"], json!(["--verbose"]));
@@ -73,7 +91,13 @@ fn test_go_launch_args_module() {
 fn test_go_launch_args_no_cwd() {
     let program = "/workspace/test.go";
     let program_args = Vec::<String>::new();
-    let launch_args = GoAdapter::launch_args_with_options(program, &program_args, None, false);
+    let launch_args = GoAdapter::launch_args_with_options(
+        program,
+        &program_args,
+        None,
+        false,
+        &std::collections::HashMap::new(),
+    );
 
     assert_eq!(launch_args["program"], program);
     assert_eq!(launch_args["stopOnEntry"], false);
