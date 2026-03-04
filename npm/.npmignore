@@ -1,0 +1,5 @@
+# Only publish bin/ and scripts/ (controlled via "files" in package.json)
+# This file excludes any downloaded binaries from being published
+bin/debugger-mcp
+bin/debugger-mcp.exe
+bin/debugger_mcp

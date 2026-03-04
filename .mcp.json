@@ -1,0 +1,7 @@
+{
+  "debugger_mcp": {
+    "type": "stdio",
+    "command": "npx",
+    "args": ["-y", "@nightscape/debugger-mcp", "serve"]
+  }
+}

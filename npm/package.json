@@ -1,0 +1,29 @@
+{
+  "name": "@nightscape/debugger-mcp",
+  "version": "0.1.0",
+  "description": "Debug any program from AI coding agents via DAP — breakpoints, stepping, variable inspection",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nightscape/debugger-mcp"
+  },
+  "bin": {
+    "debugger-mcp": "bin/run.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "keywords": [
+    "mcp",
+    "debugger",
+    "dap",
+    "debug-adapter-protocol",
+    "claude",
+    "ai",
+    "lldb"
+  ],
+  "files": [
+    "bin/",
+    "scripts/"
+  ]
+}

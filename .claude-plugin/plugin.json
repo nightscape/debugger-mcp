@@ -1,0 +1,8 @@
+{
+  "name": "debugger-mcp",
+  "description": "Debug any program from Claude Code via DAP — breakpoints, stepping, variable inspection across Python, Rust, Go, Node.js, and more",
+  "version": "0.1.0",
+  "author": {
+    "name": "Govinda Fichtner"
+  }
+}
