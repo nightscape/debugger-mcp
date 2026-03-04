@@ -72,11 +72,21 @@ use super::state::{DebugState, SessionState};
 use crate::dap::client::DapClient;
 use crate::dap::types::{Source, SourceBreakpoint};
 use crate::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+const MAX_OUTPUT_LINES: usize = 1000;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutputEntry {
+    pub line_number: usize,
+    pub category: String,
+    pub output: String,
+}
 
 /// Session mode - determines how debugging operations are routed
 ///
@@ -106,6 +116,9 @@ pub struct DebugSession {
     pub(crate) state: Arc<RwLock<SessionState>>,
     /// Pending breakpoints that will be applied after initialization completes
     pending_breakpoints: Arc<RwLock<HashMap<String, Vec<SourceBreakpoint>>>>,
+    /// Ring buffer of captured program output (stdout/stderr/console)
+    pub(crate) output_buffer: Arc<RwLock<VecDeque<OutputEntry>>>,
+    output_line_counter: Arc<AtomicUsize>,
 }
 
 impl DebugSession {
@@ -125,6 +138,8 @@ impl DebugSession {
             },
             state: Arc::new(RwLock::new(SessionState::new())),
             pending_breakpoints: Arc::new(RwLock::new(HashMap::new())),
+            output_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_OUTPUT_LINES))),
+            output_line_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -145,6 +160,8 @@ impl DebugSession {
             session_mode,
             state: Arc::new(RwLock::new(SessionState::new())),
             pending_breakpoints: Arc::new(RwLock::new(HashMap::new())),
+            output_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_OUTPUT_LINES))),
+            output_line_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -366,6 +383,41 @@ impl DebugSession {
             })
             .await;
 
+        // Handler for 'output' events from child (capture program stdout/stderr)
+        let output_buffer = self.output_buffer.clone();
+        let line_counter = self.output_line_counter.clone();
+        child_client
+            .on_event("output", move |event| {
+                if let Some(body) = &event.body {
+                    let category = body
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stdout")
+                        .to_string();
+                    let output = body
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let buf = output_buffer.clone();
+                    let counter = line_counter.clone();
+                    tokio::spawn(async move {
+                        let line_number = counter.fetch_add(1, Ordering::Relaxed);
+                        let mut buffer = buf.write().await;
+                        if buffer.len() >= MAX_OUTPUT_LINES {
+                            buffer.pop_front();
+                        }
+                        buffer.push_back(OutputEntry {
+                            line_number,
+                            category,
+                            output,
+                        });
+                    });
+                }
+            })
+            .await;
+
         info!("   Event handlers registered for child session");
 
         // 5. Set entry breakpoint on child (stopOnEntry workaround for Node.js)
@@ -582,6 +634,41 @@ impl DebugSession {
                             state.add_thread(thread_id as i32);
                         });
                     }
+                }
+            })
+            .await;
+
+        // Handler for 'output' events (program stdout/stderr/console)
+        let output_buffer = self.output_buffer.clone();
+        let line_counter = self.output_line_counter.clone();
+        client
+            .on_event("output", move |event| {
+                if let Some(body) = &event.body {
+                    let category = body
+                        .get("category")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("stdout")
+                        .to_string();
+                    let output = body
+                        .get("output")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    let buf = output_buffer.clone();
+                    let counter = line_counter.clone();
+                    tokio::spawn(async move {
+                        let line_number = counter.fetch_add(1, Ordering::Relaxed);
+                        let mut buffer = buf.write().await;
+                        if buffer.len() >= MAX_OUTPUT_LINES {
+                            buffer.pop_front();
+                        }
+                        buffer.push_back(OutputEntry {
+                            line_number,
+                            category,
+                            output,
+                        });
+                    });
                 }
             })
             .await;
@@ -936,6 +1023,24 @@ impl DebugSession {
     pub async fn get_full_state(&self) -> SessionState {
         let state = self.state.read().await;
         state.clone()
+    }
+
+    pub async fn get_output(
+        &self,
+        category: Option<&str>,
+        search: Option<&str>,
+        limit: usize,
+        since_line: Option<usize>,
+    ) -> Vec<OutputEntry> {
+        let buffer = self.output_buffer.read().await;
+        buffer
+            .iter()
+            .filter(|e| since_line.map_or(true, |s| e.line_number > s))
+            .filter(|e| category.map_or(true, |c| c == "all" || e.category == c))
+            .filter(|e| search.map_or(true, |s| e.output.contains(s)))
+            .take(limit)
+            .cloned()
+            .collect()
     }
 }
 

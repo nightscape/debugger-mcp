@@ -86,6 +86,16 @@ pub struct StepArgs {
     pub thread_id: Option<i32>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetOutputArgs {
+    pub session_id: String,
+    pub category: Option<String>,
+    pub search: Option<String>,
+    pub limit: Option<usize>,
+    pub since_line: Option<usize>,
+}
+
 pub struct ToolsHandler {
     session_manager: Arc<RwLock<SessionManager>>,
 }
@@ -109,6 +119,7 @@ impl ToolsHandler {
             "debugger_step_over" => self.debugger_step_over(arguments).await,
             "debugger_step_into" => self.debugger_step_into(arguments).await,
             "debugger_step_out" => self.debugger_step_out(arguments).await,
+            "debugger_get_output" => self.debugger_get_output(arguments).await,
             _ => Err(Error::MethodNotFound(name.to_string())),
         }
     }
@@ -451,6 +462,32 @@ impl ToolsHandler {
         }))
     }
 
+    async fn debugger_get_output(&self, arguments: Value) -> Result<Value> {
+        let args: GetOutputArgs = serde_json::from_value(arguments)?;
+
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+
+        let limit = args.limit.unwrap_or(50).min(500);
+        let entries = session
+            .get_output(
+                args.category.as_deref(),
+                args.search.as_deref(),
+                limit,
+                args.since_line,
+            )
+            .await;
+
+        let total = session.output_buffer.read().await.len();
+
+        Ok(json!({
+            "entries": entries,
+            "count": entries.len(),
+            "totalBuffered": total,
+            "truncated": entries.len() < total,
+        }))
+    }
+
     async fn debugger_disconnect(&self, arguments: Value) -> Result<Value> {
         let args: DisconnectArgs = serde_json::from_value(arguments)?;
 
@@ -757,6 +794,38 @@ impl ToolsHandler {
                     "required": ["sessionId"]
                 }
             }),
+            json!({
+                "name": "debugger_get_output",
+                "title": "Get Program Output",
+                "description": "Retrieves stdout/stderr output from the debugged program. Output is buffered in a ring buffer (last 1000 entries). Use parameters to filter by category, search for text, or paginate with sinceLine.\n\nWORKFLOW:\n1. Start a debug session with debugger_start\n2. Let the program run (continue, step, etc.)\n3. Call this tool to see what the program printed\n\nCATEGORIES:\n- stdout: Standard output from the program\n- stderr: Standard error output\n- console: Debug adapter console messages\n- all: All categories (default)\n\nPAGINATION: Use sinceLine with the line_number from the last entry to get subsequent output.\n\nSEE ALSO: debugger://sessions/{id}/output (resource for quick snapshot)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": ["stdout", "stderr", "console", "all"],
+                            "description": "Filter by output category (default: all)"
+                        },
+                        "search": {
+                            "type": "string",
+                            "description": "Filter output entries containing this text"
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Max entries to return (default: 50, max: 500)"
+                        },
+                        "sinceLine": {
+                            "type": "integer",
+                            "description": "Only return entries after this line number (for pagination)"
+                        }
+                    },
+                    "required": ["sessionId"]
+                }
+            }),
         ]
     }
 }
@@ -858,7 +927,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = ToolsHandler::list_tools();
-        assert_eq!(tools.len(), 12); // Updated from 7 to 12
+        assert_eq!(tools.len(), 13);
 
         // Verify tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -878,6 +947,7 @@ mod tests {
         assert!(tool_names.contains(&"debugger_step_over"));
         assert!(tool_names.contains(&"debugger_step_into"));
         assert!(tool_names.contains(&"debugger_step_out"));
+        assert!(tool_names.contains(&"debugger_get_output"));
     }
 
     #[test]

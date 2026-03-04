@@ -103,6 +103,13 @@ impl ResourcesHandler {
                 description: Some(format!("Call stack for session {}", session_id)),
                 mime_type: Some("application/json".to_string()),
             });
+
+            resources.push(Resource {
+                uri: format!("debugger://sessions/{}/output", session_id),
+                name: format!("Program Output ({})", &session_id[..8]),
+                description: Some(format!("stdout/stderr output from session {}", session_id)),
+                mime_type: Some("application/json".to_string()),
+            });
         }
 
         Ok(resources)
@@ -150,6 +157,11 @@ impl ResourcesHandler {
                     // debugger://sessions/{id}/stackTrace
                     let session_id = parts[0];
                     self.read_session_stack_trace(session_id).await
+                }
+                2 if parts[1] == "output" => {
+                    // debugger://sessions/{id}/output
+                    let session_id = parts[0];
+                    self.read_session_output(session_id).await
                 }
                 _ => Err(Error::InvalidRequest(format!(
                     "Unknown resource path: {}",
@@ -827,6 +839,29 @@ impl ResourcesHandler {
         })
     }
 
+    async fn read_session_output(&self, session_id: &str) -> Result<ResourceContents> {
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(session_id).await?;
+
+        let entries = session.get_output(None, None, 100, None).await;
+        let total = session.output_buffer.read().await.len();
+
+        let content = json!({
+            "sessionId": session.id,
+            "entries": entries,
+            "count": entries.len(),
+            "totalBuffered": total,
+            "hint": "Use debugger_get_output tool for filtering, searching, and pagination"
+        });
+
+        Ok(ResourceContents {
+            uri: format!("debugger://sessions/{}/output", session_id),
+            mime_type: "application/json".to_string(),
+            text: Some(serde_json::to_string_pretty(&content)?),
+            blob: None,
+        })
+    }
+
     /// List available resource templates (for MCP discovery)
     pub fn list_resource_templates() -> Vec<Value> {
         let mut templates = vec![
@@ -846,6 +881,12 @@ impl ResourcesHandler {
                 "uriTemplate": "debugger://sessions/{sessionId}/stackTrace",
                 "name": "Session Stack Trace",
                 "description": "Get the call stack for a stopped debug session",
+                "mimeType": "application/json"
+            }),
+            json!({
+                "uriTemplate": "debugger://sessions/{sessionId}/output",
+                "name": "Program Output",
+                "description": "stdout/stderr output from the debugged program (last 100 entries)",
                 "mimeType": "application/json"
             }),
             json!({
@@ -991,8 +1032,8 @@ mod tests {
     async fn test_list_resource_templates() {
         let templates = ResourcesHandler::list_resource_templates();
 
-        // Should have: 3 session templates + 3 workflow templates + 4 docs templates = 10
-        assert_eq!(templates.len(), 10);
+        // Should have: 4 session templates + 3 workflow templates + 4 docs templates = 11
+        assert_eq!(templates.len(), 11);
 
         // Check first template (sessions)
         assert!(templates[0]["uriTemplate"]
