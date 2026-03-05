@@ -1,0 +1,14 @@
+{
+  "name": "debugger-mcp",
+  "owner": {
+    "name": "Martin Mauch"
+  },
+  "plugins": [
+    {
+      "name": "debugger-mcp",
+      "source": "./",
+      "description": "Debug any program from Claude Code via DAP — breakpoints, stepping, variable inspection",
+      "version": "0.1.2"
+    }
+  ]
+}

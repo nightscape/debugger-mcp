@@ -1,6 +1,6 @@
 {
   "name": "@nightscape/debugger-mcp",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Debug any program from AI coding agents via DAP — breakpoints, stepping, variable inspection",
   "license": "MIT",
   "repository": {
