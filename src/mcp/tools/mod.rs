@@ -56,6 +56,7 @@ pub struct EvaluateArgs {
     pub session_id: String,
     pub expression: String,
     pub frame_id: Option<i32>,
+    pub context: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -381,7 +382,9 @@ impl ToolsHandler {
             ));
         }
 
-        let result = session.evaluate(&args.expression, args.frame_id).await?;
+        let result = session
+            .evaluate(&args.expression, args.frame_id, args.context)
+            .await?;
 
         Ok(json!({
             "result": result
@@ -755,6 +758,11 @@ impl ToolsHandler {
                         "frameId": {
                             "type": "integer",
                             "description": "Stack frame ID from debugger_stack_trace (optional, defaults to current frame)"
+                        },
+                        "context": {
+                            "type": "string",
+                            "description": "Evaluation context: 'watch' (default, expression evaluation), 'repl' (raw debugger command, e.g. LLDB's 'frame variable x' or 'v x'), 'hover', or 'variables' (read locals via debug info, bypasses expression parser — useful when variable names collide with language keywords)",
+                            "enum": ["watch", "repl", "hover", "variables"]
                         }
                     },
                     "required": ["sessionId", "expression"]

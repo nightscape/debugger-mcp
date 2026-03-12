@@ -505,7 +505,7 @@ async fn test_nodejs_multi_session_full_workflow() {
     // Evaluate variable
     let frame_id = stack_trace.first().unwrap().id;
     let result = session
-        .evaluate("n", Some(frame_id))
+        .evaluate("n", Some(frame_id), None)
         .await
         .expect("Failed to evaluate expression");
     println!("✅ Variable 'n' = {}", result);

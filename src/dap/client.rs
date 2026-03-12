@@ -1336,8 +1336,14 @@ impl DapClient {
         Ok(body.variables)
     }
 
-    pub async fn evaluate(&self, expression: &str, frame_id: Option<i32>) -> Result<String> {
-        let (result, variables_reference) = self.evaluate_raw(expression, frame_id).await?;
+    pub async fn evaluate(
+        &self,
+        expression: &str,
+        frame_id: Option<i32>,
+        context: Option<String>,
+    ) -> Result<String> {
+        let (result, variables_reference) =
+            self.evaluate_raw(expression, frame_id, context).await?;
 
         // Auto-expand children when variablesReference > 0 (synthetic providers like HashMap, Vec, BTreeMap)
         // Skip for strings — LLDB already shows the string content in the result summary
@@ -1358,6 +1364,7 @@ impl DapClient {
         &self,
         expression: &str,
         frame_id: Option<i32>,
+        context: Option<String>,
     ) -> Result<(String, i32)> {
         // If frame_id is None, get the top frame from stack trace
         let frame_id = if let Some(id) = frame_id {
@@ -1383,7 +1390,7 @@ impl DapClient {
         let args = EvaluateArguments {
             expression: expression.to_string(),
             frame_id,
-            context: Some("watch".to_string()),
+            context: Some(context.unwrap_or_else(|| "watch".to_string())),
         };
 
         let response = self
@@ -1813,7 +1820,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = client.evaluate("x + y", Some(1)).await.unwrap();
+        let result = client.evaluate("x + y", Some(1), None).await.unwrap();
 
         assert_eq!(result, "42");
     }

@@ -1020,7 +1020,12 @@ impl DebugSession {
         client.stack_trace(thread_id).await
     }
 
-    pub async fn evaluate(&self, expression: &str, frame_id: Option<i32>) -> Result<String> {
+    pub async fn evaluate(
+        &self,
+        expression: &str,
+        frame_id: Option<i32>,
+        context: Option<String>,
+    ) -> Result<String> {
         // If frame_id is None, auto-fetch it from stack trace using correct thread ID
         let frame_id = if let Some(id) = frame_id {
             Some(id)
@@ -1056,7 +1061,7 @@ impl DebugSession {
 
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
-        client.evaluate(expression, frame_id).await
+        client.evaluate(expression, frame_id, context).await
     }
 
     pub async fn disconnect(&self) -> Result<()> {
