@@ -463,7 +463,7 @@ async fn test_nodejs_multi_session_full_workflow() {
 
     // Set breakpoint (should go to child)
     let verified = session
-        .set_breakpoint("tests/fixtures/fizzbuzz.js".to_string(), 5)
+        .set_breakpoint("tests/fixtures/fizzbuzz.js".to_string(), 5, None, None, None)
         .await
         .expect("Failed to set breakpoint");
 

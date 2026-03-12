@@ -68,7 +68,7 @@
 //! - `docs/NODEJS_ALL_TESTS_PASSING.md` - Multi-session architecture details
 
 use super::multi_session::MultiSessionManager;
-use super::state::{DebugState, SessionState};
+use super::state::{BreakpointLocation, DebugState, SessionState};
 use crate::dap::client::DapClient;
 use crate::dap::types::{Source, SourceBreakpoint};
 use crate::Result;
@@ -268,8 +268,8 @@ impl DebugSession {
 
         info!("   ✅ Connected to vscode-js-debug on port {}", vscode_port);
 
-        // 2. Create DAP client for child
-        let child_client = DapClient::from_socket(socket).await?;
+        // 2. Create DAP client for child (wrapped in Arc early for handler capture)
+        let child_client_arc = Arc::new(RwLock::new(DapClient::from_socket(socket).await?));
         info!("   Created DAP client for child session");
 
         // 3. Initialize child session
@@ -278,7 +278,7 @@ impl DebugSession {
             "   Initializing child session with adapter_id: {}",
             child_adapter_id
         );
-        child_client.initialize(&child_adapter_id).await?;
+        child_client_arc.read().await.initialize(&child_adapter_id).await?;
         info!("   ✅ Child session initialized");
 
         // 4. Send launch with __pendingTargetId
@@ -296,7 +296,7 @@ impl DebugSession {
         // Send launch request without waiting for response
         // vscode-js-debug won't send a launch response for child connections
         info!("   Sending child launch request (no response expected)...");
-        child_client
+        child_client_arc.read().await
             .send_request_nowait("launch", Some(launch_args))
             .await?;
         info!("   ✅ Child launch request sent");
@@ -306,11 +306,12 @@ impl DebugSession {
 
         // Handler for 'stopped' events from child
         let session_state = self.state.clone();
-        child_client
+        let dap_client_for_child_stopped = child_client_arc.clone();
+        child_client_arc.read().await
             .on_event("stopped", move |event| {
                 info!("📍 [CHILD] Received 'stopped' event: {:?}", event);
-                // Update parent session state
                 let state_clone = session_state.clone();
+                let client_clone = dap_client_for_child_stopped.clone();
                 tokio::spawn(async move {
                     if let Some(body) = &event.body {
                         let thread_id = body
@@ -324,9 +325,19 @@ impl DebugSession {
                             .unwrap_or("unknown")
                             .to_string();
 
+                        let hit_bp_ids: Vec<i32> = body
+                            .get("hitBreakpointIds")
+                            .and_then(|v| v.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|v| v.as_i64().map(|n| n as i32))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+
                         info!(
-                            "   [CHILD] Updating parent state to Stopped (thread: {}, reason: {})",
-                            thread_id, reason
+                            "   [CHILD] Updating parent state to Stopped (thread: {}, reason: {}, hitBpIds: {:?})",
+                            thread_id, reason, hit_bp_ids
                         );
 
                         let mut state = state_clone.write().await;
@@ -334,6 +345,10 @@ impl DebugSession {
                             thread_id,
                             reason: reason.clone(),
                         });
+
+                        if reason == "breakpoint" && !hit_bp_ids.is_empty() {
+                            Self::handle_breakpoint_hit(&mut state, &hit_bp_ids, &client_clone).await;
+                        }
 
                         info!("   ✅ Parent state updated to Stopped (reason: {})", reason);
                     }
@@ -343,7 +358,7 @@ impl DebugSession {
 
         // Handler for 'continued' events from child
         let session_state = self.state.clone();
-        child_client
+        child_client_arc.read().await
             .on_event("continued", move |event| {
                 info!("▶️  [CHILD] Received 'continued' event: {:?}", event);
                 let state_clone = session_state.clone();
@@ -357,7 +372,7 @@ impl DebugSession {
 
         // Handler for 'terminated' events from child
         let session_state = self.state.clone();
-        child_client
+        child_client_arc.read().await
             .on_event("terminated", move |event| {
                 info!("🛑 [CHILD] Received 'terminated' event: {:?}", event);
                 let state_clone = session_state.clone();
@@ -371,7 +386,7 @@ impl DebugSession {
 
         // Handler for 'exited' events from child
         let session_state = self.state.clone();
-        child_client
+        child_client_arc.read().await
             .on_event("exited", move |event| {
                 info!("🚪 [CHILD] Received 'exited' event: {:?}", event);
                 let state_clone = session_state.clone();
@@ -386,7 +401,7 @@ impl DebugSession {
         // Handler for 'output' events from child (capture program stdout/stderr)
         let output_buffer = self.output_buffer.clone();
         let line_counter = self.output_line_counter.clone();
-        child_client
+        child_client_arc.read().await
             .on_event("output", move |event| {
                 if let Some(body) = &event.body {
                     let category = body
@@ -441,7 +456,7 @@ impl DebugSession {
             condition: None,
             hit_condition: None,
         };
-        match child_client
+        match child_client_arc.read().await
             .set_breakpoints(source.clone(), vec![entry_bp])
             .await
         {
@@ -477,7 +492,7 @@ impl DebugSession {
                     source_reference: None,
                 };
 
-                match child_client.set_breakpoints(source, bp_list.clone()).await {
+                match child_client_arc.read().await.set_breakpoints(source, bp_list.clone()).await {
                     Ok(verified_bps) => {
                         info!(
                             "     ✅ {} breakpoints set on child for {}",
@@ -499,7 +514,7 @@ impl DebugSession {
 
         // 6. Send configurationDone to child so it starts running
         info!("   Sending configurationDone to child session");
-        match child_client.configuration_done().await {
+        match child_client_arc.read().await.configuration_done().await {
             Ok(_) => info!("   ✅ Child session configuration complete"),
             Err(e) => error!("   ❌ Failed to send configurationDone to child: {}", e),
         }
@@ -508,7 +523,7 @@ impl DebugSession {
         use super::multi_session::ChildSession;
         let child = ChildSession {
             id: format!("child-{}", &target_id),
-            client: Arc::new(RwLock::new(child_client)),
+            client: child_client_arc,
             port: vscode_port, // Store vscode-js-debug port, not a child-specific port
             session_type: "pwa-node".to_string(),
         };
@@ -544,6 +559,7 @@ impl DebugSession {
 
         // Handler for 'stopped' events (breakpoints, steps, entry)
         let session_state = self.state.clone();
+        let dap_client_for_stopped = client_arc.clone();
         client
             .on_event("stopped", move |event| {
                 info!("📍 Received 'stopped' event: {:?}", event);
@@ -561,16 +577,31 @@ impl DebugSession {
                         .unwrap_or("unknown")
                         .to_string();
 
-                    info!("   Thread: {}, Reason: {}", thread_id, reason);
+                    let hit_bp_ids: Vec<i32> = body
+                        .get("hitBreakpointIds")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_i64().map(|n| n as i32))
+                                .collect()
+                        })
+                        .unwrap_or_default();
 
-                    // Update session state
+                    info!("   Thread: {}, Reason: {}, HitBpIds: {:?}", thread_id, reason, hit_bp_ids);
+
                     let state_clone = session_state.clone();
+                    let client_clone = dap_client_for_stopped.clone();
                     tokio::spawn(async move {
                         let mut state = state_clone.write().await;
                         state.set_state(DebugState::Stopped {
                             thread_id,
                             reason: reason.clone(),
                         });
+
+                        if reason == "breakpoint" && !hit_bp_ids.is_empty() {
+                            Self::handle_breakpoint_hit(&mut state, &hit_bp_ids, &client_clone).await;
+                        }
+
                         info!("✅ Session state updated to Stopped (reason: {})", reason);
                     });
                 }
@@ -813,7 +844,14 @@ impl DebugSession {
         Ok(())
     }
 
-    pub async fn set_breakpoint(&self, source_path: String, line: i32) -> Result<bool> {
+    pub async fn set_breakpoint(
+        &self,
+        source_path: String,
+        line: i32,
+        condition: Option<String>,
+        hit_condition: Option<String>,
+        activate_after: Option<BreakpointLocation>,
+    ) -> Result<bool> {
         // Check current state
         let current_state = {
             let state = self.state.read().await;
@@ -821,9 +859,25 @@ impl DebugSession {
         };
 
         info!(
-            "🔍 set_breakpoint called: {}:{}, current state: {:?}",
-            source_path, line, current_state
+            "🔍 set_breakpoint called: {}:{}, current state: {:?}, activate_after: {:?}",
+            source_path, line, current_state, activate_after
         );
+
+        // Dependent breakpoints are stored but not sent to DAP until their dependency fires
+        if let Some(dep) = activate_after {
+            let mut state = self.state.write().await;
+            // If the dependency was already hit, fall through to set immediately
+            if !state.hit_locations.contains(&dep) {
+                info!(
+                    "📌 Storing dependent breakpoint {}:{} (activates after {}:{})",
+                    source_path, line, dep.source_path, dep.line
+                );
+                state.add_dependent_breakpoint(source_path, line, condition, hit_condition, dep);
+                return Ok(true);
+            }
+            info!("📌 Dependency already hit, setting breakpoint immediately");
+            drop(state);
+        }
 
         // If still initializing, store as pending
         match current_state {
@@ -839,16 +893,15 @@ impl DebugSession {
                     .push(SourceBreakpoint {
                         line,
                         column: None,
-                        condition: None,
-                        hit_condition: None,
+                        condition: condition.clone(),
+                        hit_condition: hit_condition.clone(),
                     });
 
                 // Add to state for tracking
                 let mut state = self.state.write().await;
-                state.add_breakpoint(source_path, line);
+                state.add_breakpoint(source_path, line, condition, hit_condition);
 
                 info!("✅ Breakpoint stored as pending, will be applied during initialization");
-                // Return true to indicate it will be set
                 Ok(true)
             }
             DebugState::Running
@@ -858,7 +911,7 @@ impl DebugSession {
                 // Add to state
                 {
                     let mut state = self.state.write().await;
-                    state.add_breakpoint(source_path.clone(), line);
+                    state.add_breakpoint(source_path.clone(), line, condition.clone(), hit_condition.clone());
                 }
 
                 // Set via DAP immediately
@@ -871,8 +924,8 @@ impl DebugSession {
                 let breakpoints = vec![SourceBreakpoint {
                     line,
                     column: None,
-                    condition: None,
-                    hit_condition: None,
+                    condition,
+                    hit_condition,
                 }];
 
                 let client_arc = self.get_debug_client().await;
@@ -907,6 +960,12 @@ impl DebugSession {
             source_path, line, current_state
         );
 
+        // Always try removing from dependent breakpoints too
+        {
+            let mut state = self.state.write().await;
+            state.remove_dependent_breakpoint(&source_path, line);
+        }
+
         match current_state {
             DebugState::NotStarted | DebugState::Initializing => {
                 let mut pending = self.pending_breakpoints.write().await;
@@ -939,8 +998,8 @@ impl DebugSession {
                         .map(|bp| SourceBreakpoint {
                             line: bp.line,
                             column: None,
-                            condition: None,
-                            hit_condition: None,
+                            condition: bp.condition.clone(),
+                            hit_condition: bp.hit_condition.clone(),
                         })
                         .collect()
                 };
@@ -960,6 +1019,113 @@ impl DebugSession {
             DebugState::Terminated | DebugState::Failed { .. } => Err(crate::Error::InvalidState(
                 format!("Cannot remove breakpoint in state: {:?}", current_state),
             )),
+        }
+    }
+
+    /// Called from stopped event handlers when a breakpoint is hit.
+    /// Maps DAP breakpoint IDs to locations, records the hit, and activates
+    /// any dependent breakpoints whose dependency is now satisfied.
+    async fn handle_breakpoint_hit(
+        state: &mut SessionState,
+        hit_bp_ids: &[i32],
+        client_arc: &Arc<RwLock<DapClient>>,
+    ) {
+        // Map DAP breakpoint IDs → locations (collect first, then record)
+        let hit_locations: Vec<(String, i32)> = hit_bp_ids
+            .iter()
+            .filter_map(|&bp_id| {
+                state.breakpoints.iter().find_map(|(source_path, bps)| {
+                    bps.iter()
+                        .find(|b| b.id == Some(bp_id))
+                        .map(|bp| (source_path.clone(), bp.line))
+                })
+            })
+            .collect();
+
+        for (source_path, line) in &hit_locations {
+            info!("📌 Breakpoint hit recorded: {}:{}", source_path, line);
+            state.record_breakpoint_hit(source_path, *line);
+        }
+
+        let activated = state.take_activated_dependents();
+        if activated.is_empty() {
+            return;
+        }
+
+        info!(
+            "🔓 Activating {} dependent breakpoint(s)",
+            activated.len()
+        );
+
+        // Group activated breakpoints by source file
+        let mut by_source: HashMap<String, Vec<SourceBreakpoint>> = HashMap::new();
+        for dep in &activated {
+            by_source
+                .entry(dep.source_path.clone())
+                .or_default()
+                .push(SourceBreakpoint {
+                    line: dep.line,
+                    column: None,
+                    condition: dep.condition.clone(),
+                    hit_condition: dep.hit_condition.clone(),
+                });
+        }
+
+        // Add activated breakpoints to regular state tracking
+        for dep in &activated {
+            state.add_breakpoint(
+                dep.source_path.clone(),
+                dep.line,
+                dep.condition.clone(),
+                dep.hit_condition.clone(),
+            );
+        }
+
+        // Build full breakpoint lists per source (existing + newly activated)
+        // because DAP setBreakpoints replaces ALL breakpoints for a source
+        let mut full_lists: HashMap<String, Vec<SourceBreakpoint>> = HashMap::new();
+        for (source_path, _) in &by_source {
+            let existing: Vec<SourceBreakpoint> = state
+                .get_breakpoints(source_path)
+                .iter()
+                .map(|bp| SourceBreakpoint {
+                    line: bp.line,
+                    column: None,
+                    condition: bp.condition.clone(),
+                    hit_condition: bp.hit_condition.clone(),
+                })
+                .collect();
+            full_lists.insert(source_path.clone(), existing);
+        }
+
+        // Send to DAP
+        let client = client_arc.read().await;
+        for (source_path, breakpoints) in full_lists {
+            let source = Source {
+                name: None,
+                path: Some(source_path.clone()),
+                source_reference: None,
+            };
+            match client.set_breakpoints(source, breakpoints).await {
+                Ok(verified) => {
+                    for bp in &verified {
+                        if let (Some(id), Some(line)) = (bp.id, bp.line) {
+                            state.update_breakpoint(&source_path, line, id, bp.verified);
+                        }
+                    }
+                    info!(
+                        "   ✅ Activated breakpoints sent for {}: {} verified",
+                        source_path,
+                        verified.iter().filter(|b| b.verified).count()
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "   ❌ Failed to activate dependent breakpoints for {}: {}",
+                        source_path, e
+                    );
+                }
+            }
         }
     }
 

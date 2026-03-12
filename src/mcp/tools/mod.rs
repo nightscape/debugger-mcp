@@ -23,10 +23,20 @@ pub struct DebuggerStartArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct ActivateAfterArgs {
+    pub source_path: String,
+    pub line: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SetBreakpointArgs {
     pub session_id: String,
     pub source_path: String,
     pub line: i32,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+    pub activate_after: Option<ActivateAfterArgs>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -299,15 +309,34 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
+        let activate_after = args.activate_after.as_ref().map(|a| {
+            crate::debug::state::BreakpointLocation {
+                source_path: a.source_path.clone(),
+                line: a.line,
+            }
+        });
+
         let verified = session
-            .set_breakpoint(source_path.clone(), args.line)
+            .set_breakpoint(source_path.clone(), args.line, args.condition.clone(), args.hit_condition.clone(), activate_after)
             .await?;
 
-        Ok(json!({
+        let mut result = json!({
             "verified": verified,
             "sourcePath": source_path,
-            "line": args.line
-        }))
+            "line": args.line,
+            "condition": args.condition,
+            "hitCondition": args.hit_condition
+        });
+        if let Some(a) = &args.activate_after {
+            result["activateAfter"] = json!({
+                "sourcePath": a.source_path,
+                "line": a.line
+            });
+            if !verified {
+                result["status"] = json!("pending_dependency");
+            }
+        }
+        Ok(result)
     }
 
     async fn debugger_remove_breakpoint(&self, arguments: Value) -> Result<Value> {
@@ -459,7 +488,7 @@ impl ToolsHandler {
 
         let full_state = session.get_full_state().await;
 
-        // Collect all breakpoints from all source files
+        // Collect all active breakpoints
         let mut all_breakpoints = Vec::new();
         for (source_path, breakpoints) in full_state.breakpoints.iter() {
             for bp in breakpoints {
@@ -467,13 +496,32 @@ impl ToolsHandler {
                     "id": bp.id,
                     "verified": bp.verified,
                     "line": bp.line,
-                    "sourcePath": source_path
+                    "sourcePath": source_path,
+                    "condition": bp.condition,
+                    "hitCondition": bp.hit_condition
                 }));
             }
         }
 
+        // Collect dependent (dormant) breakpoints
+        let mut dependent_breakpoints = Vec::new();
+        for dep in &full_state.dependent_breakpoints {
+            dependent_breakpoints.push(json!({
+                "line": dep.line,
+                "sourcePath": dep.source_path,
+                "condition": dep.condition,
+                "hitCondition": dep.hit_condition,
+                "status": "pending_dependency",
+                "activateAfter": {
+                    "sourcePath": dep.activate_after.source_path,
+                    "line": dep.activate_after.line
+                }
+            }));
+        }
+
         Ok(json!({
-            "breakpoints": all_breakpoints
+            "breakpoints": all_breakpoints,
+            "dependentBreakpoints": dependent_breakpoints
         }))
     }
 
@@ -666,7 +714,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_set_breakpoint",
                 "title": "Set Breakpoint",
-                "description": "Sets a breakpoint at a specific line in a source file. The debugger will pause execution when this line is about to execute.\n\nWORKFLOW:\n1. Ensure session state is 'Stopped' (recommended) or 'Running'\n2. Call this tool with the source file path and line number\n3. Check the 'verified' field in response (true = breakpoint accepted)\n4. Use debugger_continue to resume execution until breakpoint is hit\n\nTIMING: Returns in 5-20ms\n\nIMPORTANT: Use stopOnEntry: true when starting the session to pause before code execution, giving you time to set breakpoints.\n\nTIP: The sourcePath must match the path used by the debugger. For best results, use absolute paths.\n\nRETURNS:\n- verified: true if breakpoint was successfully set and recognized by the debugger\n- sourcePath: echo of the source file path\n- line: echo of the line number\n\nSEE ALSO: debugger_continue (to hit the breakpoint), debugger://workflows (breakpoint examples)",
+                "description": "Sets a breakpoint at a specific line in a source file. The debugger will pause execution when this line is about to execute.\n\nWORKFLOW:\n1. Ensure session state is 'Stopped' (recommended) or 'Running'\n2. Call this tool with the source file path and line number\n3. Optionally add a condition, hitCondition, or activateAfter to control when the breakpoint fires\n4. Check the 'verified' field in response (true = breakpoint accepted)\n5. Use debugger_continue to resume execution until breakpoint is hit\n\nCONDITIONAL BREAKPOINTS:\n- condition: An expression evaluated at the breakpoint. Only pauses when truthy. Example: 'i > 100'\n- hitCondition: An expression evaluated against the hit count. Examples: '>= 5' (5th+ hit), '== 3' (only 3rd hit), '% 10' (every 10th hit)\n\nDEPENDENT BREAKPOINTS:\n- activateAfter: {sourcePath, line} — This breakpoint stays dormant until the specified breakpoint is hit first. Useful for debugging code that only matters after a certain execution point (e.g., activate a breakpoint in a handler only after the setup function runs). The dependency breakpoint must also be set.\n\nTIMING: Returns in 5-20ms\n\nIMPORTANT: Use stopOnEntry: true when starting the session to pause before code execution, giving you time to set breakpoints.\n\nTIP: The sourcePath must match the path used by the debugger. For best results, use absolute paths.\n\nRETURNS:\n- verified: true if breakpoint was successfully set and recognized by the debugger\n- sourcePath: echo of the source file path\n- line: echo of the line number\n- condition: echo of condition (if set)\n- hitCondition: echo of hitCondition (if set)\n- activateAfter: echo of dependency (if set)\n- status: 'pending_dependency' if waiting for dependency\n\nSEE ALSO: debugger_continue (to hit the breakpoint), debugger_list_breakpoints (shows active and dependent breakpoints)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -681,6 +729,29 @@ impl ToolsHandler {
                         "line": {
                             "type": "integer",
                             "description": "Line number where breakpoint should be set (1-indexed, i.e., first line is 1)"
+                        },
+                        "condition": {
+                            "type": "string",
+                            "description": "Expression evaluated at the breakpoint location. The breakpoint only pauses execution when this expression is truthy. Example: 'x > 10' or 'name == \"foo\"'"
+                        },
+                        "hitCondition": {
+                            "type": "string",
+                            "description": "Expression evaluated against the hit count. The breakpoint only pauses when this expression is true. Examples: '>= 5' (pause on 5th+ hit), '== 3' (pause only on 3rd hit), '% 2' (pause on every 2nd hit)"
+                        },
+                        "activateAfter": {
+                            "type": "object",
+                            "description": "Makes this a dependent breakpoint that remains dormant until the specified breakpoint is hit. Once the dependency fires, this breakpoint is automatically activated. Useful for debugging code that is only relevant after a certain point in execution.",
+                            "properties": {
+                                "sourcePath": {
+                                    "type": "string",
+                                    "description": "Source file path of the dependency breakpoint"
+                                },
+                                "line": {
+                                    "type": "integer",
+                                    "description": "Line number of the dependency breakpoint"
+                                }
+                            },
+                            "required": ["sourcePath", "line"]
                         }
                     },
                     "required": ["sessionId", "sourcePath", "line"]
