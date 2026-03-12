@@ -67,6 +67,24 @@ impl SessionState {
         }
     }
 
+    pub fn remove_breakpoint(&mut self, source: &str, line: i32) -> bool {
+        let removed = if let Some(bps) = self.breakpoints.get_mut(source) {
+            let len_before = bps.len();
+            bps.retain(|bp| bp.line != line);
+            bps.len() < len_before
+        } else {
+            false
+        };
+        if removed {
+            if let Some(bps) = self.breakpoints.get(source) {
+                if bps.is_empty() {
+                    self.breakpoints.remove(source);
+                }
+            }
+        }
+        removed
+    }
+
     pub fn get_breakpoints(&self, source: &str) -> Vec<Breakpoint> {
         self.breakpoints.get(source).cloned().unwrap_or_default()
     }
@@ -129,6 +147,33 @@ mod tests {
         assert_eq!(state.threads.len(), 2);
         assert!(state.threads.contains(&1));
         assert!(state.threads.contains(&2));
+    }
+
+    #[test]
+    fn test_remove_breakpoint() {
+        let mut state = SessionState::new();
+        state.add_breakpoint("test.py".to_string(), 10);
+        state.add_breakpoint("test.py".to_string(), 20);
+
+        assert!(state.remove_breakpoint("test.py", 10));
+        let bps = state.get_breakpoints("test.py");
+        assert_eq!(bps.len(), 1);
+        assert_eq!(bps[0].line, 20);
+    }
+
+    #[test]
+    fn test_remove_breakpoint_last_cleans_up_entry() {
+        let mut state = SessionState::new();
+        state.add_breakpoint("test.py".to_string(), 10);
+
+        assert!(state.remove_breakpoint("test.py", 10));
+        assert!(state.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn test_remove_breakpoint_nonexistent() {
+        let mut state = SessionState::new();
+        assert!(!state.remove_breakpoint("test.py", 10));
     }
 
     #[test]

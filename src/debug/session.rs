@@ -896,6 +896,73 @@ impl DebugSession {
         }
     }
 
+    pub async fn remove_breakpoint(&self, source_path: String, line: i32) -> Result<()> {
+        let current_state = {
+            let state = self.state.read().await;
+            state.state.clone()
+        };
+
+        info!(
+            "🔍 remove_breakpoint called: {}:{}, current state: {:?}",
+            source_path, line, current_state
+        );
+
+        match current_state {
+            DebugState::NotStarted | DebugState::Initializing => {
+                let mut pending = self.pending_breakpoints.write().await;
+                if let Some(bps) = pending.get_mut(&source_path) {
+                    bps.retain(|bp| bp.line != line);
+                    if bps.is_empty() {
+                        pending.remove(&source_path);
+                    }
+                }
+
+                let mut state = self.state.write().await;
+                state.remove_breakpoint(&source_path, line);
+                Ok(())
+            }
+            DebugState::Running
+            | DebugState::Stopped { .. }
+            | DebugState::Initialized
+            | DebugState::Launching => {
+                {
+                    let mut state = self.state.write().await;
+                    state.remove_breakpoint(&source_path, line);
+                }
+
+                // Re-send remaining breakpoints for this source file via DAP
+                let remaining: Vec<SourceBreakpoint> = {
+                    let state = self.state.read().await;
+                    state
+                        .get_breakpoints(&source_path)
+                        .iter()
+                        .map(|bp| SourceBreakpoint {
+                            line: bp.line,
+                            column: None,
+                            condition: None,
+                            hit_condition: None,
+                        })
+                        .collect()
+                };
+
+                let source = Source {
+                    name: None,
+                    path: Some(source_path.clone()),
+                    source_reference: None,
+                };
+
+                let client_arc = self.get_debug_client().await;
+                let client = client_arc.read().await;
+                client.set_breakpoints(source, remaining).await?;
+
+                Ok(())
+            }
+            DebugState::Terminated | DebugState::Failed { .. } => Err(crate::Error::InvalidState(
+                format!("Cannot remove breakpoint in state: {:?}", current_state),
+            )),
+        }
+    }
+
     pub async fn continue_execution(&self) -> Result<()> {
         let state = self.state.read().await;
         let thread_id = state.threads.first().copied().unwrap_or(1);

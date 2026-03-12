@@ -31,6 +31,14 @@ pub struct SetBreakpointArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RemoveBreakpointArgs {
+    pub session_id: String,
+    pub source_path: String,
+    pub line: i32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ContinueArgs {
     pub session_id: String,
 }
@@ -153,6 +161,7 @@ impl ToolsHandler {
             "debugger_start" => self.debugger_start(arguments).await,
             "debugger_session_state" => self.debugger_session_state(arguments).await,
             "debugger_set_breakpoint" => self.debugger_set_breakpoint(arguments).await,
+            "debugger_remove_breakpoint" => self.debugger_remove_breakpoint(arguments).await,
             "debugger_continue" => self.debugger_continue(arguments).await,
             "debugger_stack_trace" => self.debugger_stack_trace(arguments).await,
             "debugger_evaluate" => self.debugger_evaluate(arguments).await,
@@ -294,6 +303,29 @@ impl ToolsHandler {
 
         Ok(json!({
             "verified": verified,
+            "sourcePath": source_path,
+            "line": args.line
+        }))
+    }
+
+    async fn debugger_remove_breakpoint(&self, arguments: Value) -> Result<Value> {
+        let args: RemoveBreakpointArgs = serde_json::from_value(arguments)?;
+
+        let validated_source = security::validate_source_path(&args.source_path, None)?;
+        let source_path = validated_source
+            .to_str()
+            .ok_or_else(|| Error::Internal("Non-UTF8 source path (invalid encoding)".to_string()))?
+            .to_string();
+
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+
+        session
+            .remove_breakpoint(source_path.clone(), args.line)
+            .await?;
+
+        Ok(json!({
+            "removed": true,
             "sourcePath": source_path,
             "line": args.line
         }))
@@ -795,6 +827,29 @@ impl ToolsHandler {
                 }
             }),
             json!({
+                "name": "debugger_remove_breakpoint",
+                "title": "Remove Breakpoint",
+                "description": "Removes a breakpoint at the specified source file and line number.\n\nWORKFLOW:\n1. Use debugger_list_breakpoints to see current breakpoints\n2. Call this tool with the sourcePath and line to remove\n3. The breakpoint is immediately removed from the debug session\n\nTIMING: Returns quickly (<50ms)\n\nRETURNS: Confirmation with the sourcePath and line that was removed",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        },
+                        "sourcePath": {
+                            "type": "string",
+                            "description": "Absolute path to the source file"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number of the breakpoint to remove"
+                        }
+                    },
+                    "required": ["sessionId", "sourcePath", "line"]
+                }
+            }),
+            json!({
                 "name": "debugger_step_over",
                 "title": "Step Over (Next Line)",
                 "description": "Executes the current line and stops at the next line. Does NOT step into function calls.\n\nREQUIRES: Program must be stopped (at breakpoint, entry, or previous step)\n\nWORKFLOW:\n1. Ensure program is stopped\n2. Call this tool to execute one line\n3. Use debugger_wait_for_stop to wait for the step to complete\n4. Inspect state with debugger_stack_trace and debugger_evaluate\n\nTIMING: Returns quickly; use debugger_wait_for_stop to detect completion\n\nSEE ALSO: debugger_step_into (to step into functions), debugger_step_out (to step out)",
@@ -984,7 +1039,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = ToolsHandler::list_tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
 
         // Verify tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -1001,6 +1056,7 @@ mod tests {
         // New tools
         assert!(tool_names.contains(&"debugger_wait_for_stop"));
         assert!(tool_names.contains(&"debugger_list_breakpoints"));
+        assert!(tool_names.contains(&"debugger_remove_breakpoint"));
         assert!(tool_names.contains(&"debugger_step_over"));
         assert!(tool_names.contains(&"debugger_step_into"));
         assert!(tool_names.contains(&"debugger_step_out"));
