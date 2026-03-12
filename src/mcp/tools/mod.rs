@@ -39,6 +39,7 @@ pub struct ContinueArgs {
 #[serde(rename_all = "camelCase")]
 pub struct StackTraceArgs {
     pub session_id: String,
+    pub format: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +95,48 @@ pub struct GetOutputArgs {
     pub search: Option<String>,
     pub limit: Option<usize>,
     pub since_line: Option<usize>,
+}
+
+fn format_stack_frames(
+    frames: &[crate::dap::types::StackFrame],
+    program: &str,
+) -> String {
+    let program_components: Vec<_> = std::path::Path::new(program).components().collect();
+    let lines: Vec<String> = frames
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let location = match &f.source {
+                Some(src) => {
+                    let full = src
+                        .path
+                        .as_deref()
+                        .or(src.name.as_deref())
+                        .unwrap_or("?");
+                    let src_components: Vec<_> =
+                        std::path::Path::new(full).components().collect();
+                    let common_len = program_components
+                        .iter()
+                        .zip(src_components.iter())
+                        .take_while(|(a, b)| a == b)
+                        .count();
+                    if common_len > 0 {
+                        let display = src_components[common_len..]
+                            .iter()
+                            .collect::<std::path::PathBuf>()
+                            .to_string_lossy()
+                            .into_owned();
+                        format!("{}:{}", display, f.line)
+                    } else {
+                        format!("{}:{}", full, f.line)
+                    }
+                }
+                None => format!("line {}", f.line),
+            };
+            format!("#{} [id={}] {} ({})", i, f.id, f.name, location)
+        })
+        .collect();
+    lines.join("\n")
 }
 
 pub struct ToolsHandler {
@@ -285,9 +328,11 @@ impl ToolsHandler {
 
         let frames = session.stack_trace().await?;
 
-        Ok(json!({
-            "stackFrames": frames
-        }))
+        if args.format.as_deref() != Some("json") {
+            Ok(json!({ "stackTrace": format_stack_frames(&frames, &session.program) }))
+        } else {
+            Ok(json!({ "stackFrames": frames }))
+        }
     }
 
     async fn debugger_evaluate(&self, arguments: Value) -> Result<Value> {
@@ -325,11 +370,18 @@ impl ToolsHandler {
 
             // Check if we're stopped
             if let crate::debug::state::DebugState::Stopped { thread_id, reason } = state {
-                return Ok(json!({
+                let mut result = json!({
                     "state": "Stopped",
                     "threadId": thread_id,
                     "reason": reason
-                }));
+                });
+
+                if let Ok(frames) = session.stack_trace(Some(3)).await {
+                    result["stackTrace"] =
+                        json!(format_stack_frames(&frames, &session.program));
+                }
+
+                return Ok(result);
             }
 
             // Check if program terminated
@@ -635,6 +687,11 @@ impl ToolsHandler {
                         "sessionId": {
                             "type": "string",
                             "description": "Session ID from debugger_start"
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["json", "text"],
+                            "description": "Output format. 'text' returns a compact line-by-line representation (e.g. '#0 [id=5] main (src/main.rs:42)'), 'json' returns full structured data. Defaults to 'text'."
                         }
                     },
                     "required": ["sessionId"]
