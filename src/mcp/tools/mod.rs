@@ -9,6 +9,16 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct BreakpointSpec {
+    pub source_path: String,
+    pub line: i32,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+    pub activate_after: Option<ActivateAfterArgs>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct DebuggerStartArgs {
     pub language: String,
     pub program: String,
@@ -19,6 +29,8 @@ pub struct DebuggerStartArgs {
     pub stop_on_entry: bool,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub breakpoints: Vec<BreakpointSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -240,6 +252,9 @@ impl ToolsHandler {
             None
         };
 
+        let has_breakpoints = !args.breakpoints.is_empty();
+        let stop_on_entry = args.stop_on_entry || has_breakpoints;
+
         let manager = self.session_manager.read().await;
         let session_id = manager
             .create_session(
@@ -247,14 +262,87 @@ impl ToolsHandler {
                 program,
                 args.args,
                 validated_cwd,
-                args.stop_on_entry,
+                stop_on_entry,
                 args.env,
             )
             .await?;
 
+        if !has_breakpoints {
+            return Ok(json!({
+                "sessionId": session_id,
+                "status": "started"
+            }));
+        }
+
+        // Wait for the session to stop on entry so we can set breakpoints
+        let session = manager.get_session(&session_id).await?;
+        let timeout = tokio::time::Duration::from_secs(30);
+        let start = tokio::time::Instant::now();
+        loop {
+            let state = session.get_state().await;
+            if matches!(state, crate::debug::state::DebugState::Stopped { .. }) {
+                break;
+            }
+            if matches!(state, crate::debug::state::DebugState::Terminated) {
+                return Err(Error::Dap("Program terminated before breakpoints could be set".into()));
+            }
+            if let crate::debug::state::DebugState::Failed { error } = state {
+                return Err(Error::Dap(format!("Session failed: {}", error)));
+            }
+            if start.elapsed() > timeout {
+                return Err(Error::InvalidState(
+                    "Timeout waiting for program to stop on entry for breakpoint setup".into(),
+                ));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Set all breakpoints
+        let mut bp_results = Vec::new();
+        for bp in &args.breakpoints {
+            let validated_source = security::validate_source_path(&bp.source_path, None)?;
+            let source_path = validated_source
+                .to_str()
+                .ok_or_else(|| Error::Internal("Non-UTF8 source path".into()))?
+                .to_string();
+
+            let activate_after = bp.activate_after.as_ref().map(|a| {
+                crate::debug::state::BreakpointLocation {
+                    source_path: a.source_path.clone(),
+                    line: a.line,
+                }
+            });
+
+            let verified = session
+                .set_breakpoint(source_path.clone(), bp.line, bp.condition.clone(), bp.hit_condition.clone(), activate_after)
+                .await?;
+
+            let mut bp_result = json!({
+                "verified": verified,
+                "sourcePath": source_path,
+                "line": bp.line
+            });
+            if let Some(a) = &bp.activate_after {
+                bp_result["activateAfter"] = json!({
+                    "sourcePath": a.source_path,
+                    "line": a.line
+                });
+                if !verified {
+                    bp_result["status"] = json!("pending_dependency");
+                }
+            }
+            bp_results.push(bp_result);
+        }
+
+        // If the user didn't originally request stop_on_entry, continue execution
+        if !args.stop_on_entry {
+            session.continue_execution().await?;
+        }
+
         Ok(json!({
             "sessionId": session_id,
-            "status": "started"
+            "status": "started",
+            "breakpoints": bp_results
         }))
     }
 
@@ -645,7 +733,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_start",
                 "title": "Start Debugging Session",
-                "description": "Starts a new debugging session for a program. RETURNS IMMEDIATELY with a sessionId while initialization happens asynchronously in the background.\n\nIMPORTANT WORKFLOW:\n1. Call this tool first to create a session\n2. Use debugger_wait_for_stop to wait for entry point (if stopOnEntry: true)\n3. Once stopped, set breakpoints with debugger_set_breakpoint\n4. Control execution with debugger_continue\n\nTIMING: Returns in <100ms. Background initialization takes 200-500ms.\n\n⭐ CRITICAL: stopOnEntry Parameter\n=================================\nFor reliable breakpoint debugging, ALWAYS use stopOnEntry: true:\n\n✅ RECOMMENDED (with stopOnEntry: true):\n  - Program pauses at first executable line\n  - Gives you time to set breakpoints before execution\n  - Prevents program from completing before breakpoints are set\n  - Required for debugging programs that execute quickly\n\n❌ NOT RECOMMENDED (stopOnEntry: false or omitted):\n  - Program runs immediately upon start\n  - May complete before breakpoints can be set\n  - Breakpoints might be missed\n  - Only use if you don't need breakpoints\n\nEXAMPLE WORKFLOW:\n  debugger_start({program: \"app.py\", stopOnEntry: true})\n  debugger_wait_for_stop()  // Wait for entry point\n  debugger_set_breakpoint({line: 20})  // Set while paused ✓\n  debugger_continue()  // Now resume to breakpoint\n\nSEE ALSO: debugger_wait_for_stop (efficient waiting), debugger_session_state (state checking), debugger://workflows (complete examples)",
+                "description": "Starts a new debugging session for a program.\n\n⭐ RECOMMENDED: Pass breakpoints directly to avoid multiple round-trips:\n  debugger_start({program: \"app.py\", breakpoints: [{sourcePath: \"/abs/path/app.py\", line: 20}]})\n  debugger_wait_for_stop()  // Program runs and stops at breakpoint\n\nWhen breakpoints are provided:\n- The program automatically pauses on entry, sets all breakpoints, then continues\n- If stopOnEntry is also true, the program stays paused after setting breakpoints\n- Returns the list of set breakpoints with verification status\n\nWithout breakpoints, use the manual workflow:\n1. debugger_start({program: \"app.py\", stopOnEntry: true})\n2. debugger_wait_for_stop()\n3. debugger_set_breakpoint({line: 20})\n4. debugger_continue()\n\nSEE ALSO: debugger_wait_for_stop, debugger_set_breakpoint",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -674,6 +762,29 @@ impl ToolsHandler {
                             "type": "object",
                             "additionalProperties": { "type": "string" },
                             "description": "Environment variables to set for the debugged program (optional, e.g., {\"LOG_LEVEL\": \"debug\"})"
+                        },
+                        "breakpoints": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "sourcePath": { "type": "string", "description": "Absolute path to the source file" },
+                                    "line": { "type": "integer", "description": "Line number for the breakpoint" },
+                                    "condition": { "type": "string", "description": "Optional condition expression" },
+                                    "hitCondition": { "type": "string", "description": "Optional hit count condition" },
+                                    "activateAfter": {
+                                        "type": "object",
+                                        "properties": {
+                                            "sourcePath": { "type": "string", "description": "Source file of the trigger breakpoint" },
+                                            "line": { "type": "integer", "description": "Line of the trigger breakpoint" }
+                                        },
+                                        "required": ["sourcePath", "line"],
+                                        "description": "Only activate this breakpoint after the specified breakpoint is hit"
+                                    }
+                                },
+                                "required": ["sourcePath", "line"]
+                            },
+                            "description": "Breakpoints to set before the program runs. The program will pause on entry, set all breakpoints, then continue (unless stopOnEntry is also true)."
                         }
                     },
                     "required": ["language", "program"]
