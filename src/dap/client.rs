@@ -472,7 +472,9 @@ impl DapClient {
         Ok(response)
     }
 
-    /// Send a request with a timeout (aggressive timeout wrapper)
+    /// Send a request with a timeout.
+    /// On timeout, removes the orphaned entry from pending_requests to prevent
+    /// stale requests from blocking subsequent operations.
     pub async fn send_request_with_timeout(
         &self,
         command: &str,
@@ -484,14 +486,49 @@ impl DapClient {
             command, timeout
         );
 
-        tokio::time::timeout(timeout, self.send_request(command, arguments))
-            .await
-            .map_err(|_| {
-                Error::Dap(format!(
+        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
+
+        let request = Request {
+            seq,
+            command: command.to_string(),
+            arguments,
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        {
+            let mut pending = self.pending_requests.write().await;
+            pending.insert(seq, tx);
+        }
+
+        self.write_tx
+            .send(Message::Request(request))
+            .map_err(|_| Error::Dap("Write channel closed".to_string()))?;
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(response)) => {
+                info!(
+                    "✅ send_request_with_timeout: Received response for '{}' (seq {}), success: {}",
+                    command, seq, response.success
+                );
+                Ok(response)
+            }
+            Ok(Err(_)) => {
+                self.pending_requests.write().await.remove(&seq);
+                Err(Error::Dap("Request cancelled or connection closed".to_string()))
+            }
+            Err(_) => {
+                self.pending_requests.write().await.remove(&seq);
+                warn!(
+                    "⏱️  send_request_with_timeout: '{}' (seq {}) timed out after {:?}, cleaned up pending request",
+                    command, seq, timeout
+                );
+                Err(Error::Dap(format!(
                     "Request '{}' timed out after {:?}",
                     command, timeout
-                ))
-            })?
+                )))
+            }
+        }
     }
 
     /// Send a request with a callback for the response
@@ -885,6 +922,25 @@ impl DapClient {
         }
     }
 
+    /// Cancel all pending requests by removing them from the tracking map and
+    /// dropping the senders (which causes waiting receivers to get a channel-closed error).
+    /// Returns the number of cancelled requests.
+    ///
+    /// This is used before execution control commands (continue, step) to ensure
+    /// a stuck evaluate doesn't prevent the adapter from processing new requests.
+    pub async fn cancel_pending_requests(&self) -> usize {
+        let mut pending = self.pending_requests.write().await;
+        let count = pending.len();
+        if count > 0 {
+            warn!(
+                "🧹 cancel_pending_requests: Dropping {} orphaned pending request(s)",
+                count
+            );
+            pending.clear();
+        }
+        count
+    }
+
     pub async fn configuration_done(&self) -> Result<()> {
         let response = self.send_request("configurationDone", None).await?;
 
@@ -968,7 +1024,11 @@ impl DapClient {
         let args = ContinueArguments { thread_id };
 
         let response = self
-            .send_request("continue", Some(serde_json::to_value(args)?))
+            .send_request_with_timeout(
+                "continue",
+                Some(serde_json::to_value(args)?),
+                std::time::Duration::from_secs(30),
+            )
             .await?;
 
         if !response.success {
@@ -1221,7 +1281,11 @@ impl DapClient {
         let args = NextArguments { thread_id };
 
         let response = self
-            .send_request("next", Some(serde_json::to_value(args)?))
+            .send_request_with_timeout(
+                "next",
+                Some(serde_json::to_value(args)?),
+                std::time::Duration::from_secs(30),
+            )
             .await?;
 
         if !response.success {
@@ -1238,7 +1302,11 @@ impl DapClient {
         let args = StepInArguments { thread_id };
 
         let response = self
-            .send_request("stepIn", Some(serde_json::to_value(args)?))
+            .send_request_with_timeout(
+                "stepIn",
+                Some(serde_json::to_value(args)?),
+                std::time::Duration::from_secs(30),
+            )
             .await?;
 
         if !response.success {
@@ -1252,7 +1320,11 @@ impl DapClient {
         let args = StepOutArguments { thread_id };
 
         let response = self
-            .send_request("stepOut", Some(serde_json::to_value(args)?))
+            .send_request_with_timeout(
+                "stepOut",
+                Some(serde_json::to_value(args)?),
+                std::time::Duration::from_secs(30),
+            )
             .await?;
 
         if !response.success {

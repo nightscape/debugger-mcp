@@ -1136,6 +1136,12 @@ impl DebugSession {
 
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
+
+        // Clear any orphaned pending requests (e.g. from a timed-out evaluate)
+        // before sending continue — a stuck adapter won't process new requests
+        // until old ones are resolved.
+        client.cancel_pending_requests().await;
+
         client.continue_execution(thread_id).await?;
 
         let mut state = self.state.write().await;
@@ -1147,6 +1153,7 @@ impl DebugSession {
     pub async fn step_over(&self, thread_id: i32) -> Result<()> {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
+        client.cancel_pending_requests().await;
         client.next(thread_id).await?;
 
         // State will be updated by 'stopped' event handler when step completes
@@ -1156,6 +1163,7 @@ impl DebugSession {
     pub async fn step_into(&self, thread_id: i32) -> Result<()> {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
+        client.cancel_pending_requests().await;
         client.step_in(thread_id).await?;
 
         // State will be updated by 'stopped' event handler when step completes
@@ -1165,6 +1173,7 @@ impl DebugSession {
     pub async fn step_out(&self, thread_id: i32) -> Result<()> {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
+        client.cancel_pending_requests().await;
         client.step_out(thread_id).await?;
 
         // State will be updated by 'stopped' event handler when step completes
