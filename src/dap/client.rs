@@ -1272,9 +1272,15 @@ impl DapClient {
             levels,
         };
 
+        let timeout = std::time::Duration::from_secs(10);
         let response = self
-            .send_request("stackTrace", Some(serde_json::to_value(args)?))
-            .await?;
+            .send_request_with_timeout("stackTrace", Some(serde_json::to_value(args)?), timeout)
+            .await
+            .map_err(|e| Error::Dap(format!(
+                "stackTrace timed out after {timeout:?} for thread {thread_id}. \
+                 The debug adapter may be unresponsive. Try: debugger_disconnect and restart the session. \
+                 Original error: {e}"
+            )))?;
 
         if !response.success {
             return Err(Error::Dap(format!(
@@ -1308,9 +1314,16 @@ impl DapClient {
             count: None,
         };
 
+        let timeout = std::time::Duration::from_secs(10);
         let response = self
-            .send_request("variables", Some(serde_json::to_value(args)?))
-            .await?;
+            .send_request_with_timeout("variables", Some(serde_json::to_value(args)?), timeout)
+            .await
+            .map_err(|e| Error::Dap(format!(
+                "variables request timed out after {timeout:?} (variablesReference={variables_reference}). \
+                 This often happens with large or deeply nested types (e.g. HashMap, Vec with many elements). \
+                 Try evaluating a specific field instead of the whole variable. \
+                 Original error: {e}"
+            )))?;
 
         if !response.success {
             return Err(Error::Dap(format!(
@@ -1348,9 +1361,17 @@ impl DapClient {
         // Auto-expand children when variablesReference > 0 (synthetic providers like HashMap, Vec, BTreeMap)
         // Skip for strings — LLDB already shows the string content in the result summary
         if variables_reference > 0 && !result.starts_with('"') {
-            match self.expand_variable(variables_reference, 2).await {
-                Ok(expanded) if !expanded.is_empty() => {
+            let expand_timeout = std::time::Duration::from_secs(5);
+            match tokio::time::timeout(expand_timeout, self.expand_variable(variables_reference, 2)).await {
+                Ok(Ok(expanded)) if !expanded.is_empty() => {
                     return Ok(format!("{}\n{}", result, expanded));
+                }
+                Err(_) => {
+                    warn!(
+                        "⚠️  Auto-expansion of '{}' timed out after {:?} — type is too large/nested. Returning summary only.",
+                        expression, expand_timeout
+                    );
+                    return Ok(format!("{}\n  (children omitted: auto-expansion timed out — try evaluating specific fields)", result));
                 }
                 _ => {}
             }
@@ -1393,9 +1414,20 @@ impl DapClient {
             context: Some(context.unwrap_or_else(|| "watch".to_string())),
         };
 
+        let timeout = std::time::Duration::from_secs(15);
         let response = self
-            .send_request("evaluate", Some(serde_json::to_value(args)?))
-            .await?;
+            .send_request_with_timeout("evaluate", Some(serde_json::to_value(args)?), timeout)
+            .await
+            .map_err(|e| Error::Dap(format!(
+                "evaluate timed out after {timeout:?} for expression '{}'. \
+                 This can happen when: (1) the expression triggers expensive computation in the debugger, \
+                 (2) the type is large/deeply nested (e.g. HashMap, Vec with many elements), or \
+                 (3) the debug adapter is stuck. \
+                 Try: use context=\"repl\" with an LLDB command like 'frame variable <name>' for faster inspection, \
+                 or evaluate a specific field (e.g. 'obj.field') instead of the whole object. \
+                 Original error: {e}",
+                expression
+            )))?;
 
         if !response.success {
             return Err(Error::Dap(format!(
