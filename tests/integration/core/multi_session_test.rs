@@ -496,7 +496,7 @@ async fn test_nodejs_multi_session_full_workflow() {
 
     // Get stack trace
     let stack_trace = session
-        .stack_trace()
+        .stack_trace(None)
         .await
         .expect("Failed to get stack trace");
     assert!(!stack_trace.is_empty(), "Stack trace should not be empty");

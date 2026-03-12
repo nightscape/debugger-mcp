@@ -820,7 +820,7 @@ impl ResourcesHandler {
         // Only get stack trace if stopped
         let frames: Vec<crate::dap::types::StackFrame> = match state {
             crate::debug::state::DebugState::Stopped { .. } => {
-                session.stack_trace().await.unwrap_or_default()
+                session.stack_trace(None).await.unwrap_or_default()
             }
             _ => vec![],
         };

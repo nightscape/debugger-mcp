@@ -48,6 +48,7 @@ pub struct ContinueArgs {
 pub struct StackTraceArgs {
     pub session_id: String,
     pub format: Option<String>,
+    pub limit: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -359,7 +360,12 @@ impl ToolsHandler {
             ));
         }
 
-        let frames = session.stack_trace().await?;
+        let levels = match args.limit {
+            Some(0) => None,
+            Some(n) => Some(n),
+            None => Some(20),
+        };
+        let frames = session.stack_trace(levels).await?;
 
         if args.format.as_deref() != Some("json") {
             Ok(json!({ "stackTrace": format_stack_frames(&frames, &session.program) }))
@@ -727,6 +733,10 @@ impl ToolsHandler {
                             "type": "string",
                             "enum": ["json", "text"],
                             "description": "Output format. 'text' returns a compact line-by-line representation (e.g. '#0 [id=5] main (src/main.rs:42)'), 'json' returns full structured data. Defaults to 'text'."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of stack frames to return. Defaults to 20. Use 0 to return all frames."
                         }
                     },
                     "required": ["sessionId"]

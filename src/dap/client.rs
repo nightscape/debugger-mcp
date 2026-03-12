@@ -1265,11 +1265,11 @@ impl DapClient {
         Ok(())
     }
 
-    pub async fn stack_trace(&self, thread_id: i32) -> Result<Vec<StackFrame>> {
+    pub async fn stack_trace(&self, thread_id: i32, levels: Option<i32>) -> Result<Vec<StackFrame>> {
         let args = StackTraceArguments {
             thread_id,
             start_frame: None,
-            levels: None,
+            levels,
         };
 
         let response = self
@@ -1371,7 +1371,7 @@ impl DapClient {
             Some(id)
         } else {
             // Get current thread (assume thread 0 for simplicity)
-            match self.stack_trace(0).await {
+            match self.stack_trace(0, Some(1)).await {
                 Ok(frames) if !frames.is_empty() => {
                     info!("📍 Auto-fetched frame_id {} for evaluate", frames[0].id);
                     Some(frames[0].id)
@@ -1796,7 +1796,7 @@ mod tests {
             .await
             .unwrap();
 
-        let frames = client.stack_trace(1).await.unwrap();
+        let frames = client.stack_trace(1, None).await.unwrap();
 
         assert_eq!(frames.len(), 1);
         assert_eq!(frames[0].name, "main");

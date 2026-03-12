@@ -1005,7 +1005,7 @@ impl DebugSession {
         Ok(())
     }
 
-    pub async fn stack_trace(&self) -> Result<Vec<crate::dap::types::StackFrame>> {
+    pub async fn stack_trace(&self, levels: Option<i32>) -> Result<Vec<crate::dap::types::StackFrame>> {
         let state = self.state.read().await;
 
         // Get thread_id from the current Stopped state, or fallback to threads list
@@ -1017,7 +1017,7 @@ impl DebugSession {
 
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
-        client.stack_trace(thread_id).await
+        client.stack_trace(thread_id, levels).await
     }
 
     pub async fn evaluate(
@@ -1036,7 +1036,7 @@ impl DebugSession {
                 // Get stack trace with correct thread ID
                 let client_arc = self.get_debug_client().await;
                 let client = client_arc.read().await;
-                match client.stack_trace(*thread_id).await {
+                match client.stack_trace(*thread_id, Some(1)).await {
                     Ok(frames) if !frames.is_empty() => {
                         info!(
                             "📍 Auto-fetched frame_id {} from thread {}",
