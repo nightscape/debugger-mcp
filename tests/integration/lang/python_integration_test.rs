@@ -498,7 +498,7 @@ async fn test_tools_list() {
     // This calls the static method directly
     let tools = ToolsHandler::list_tools();
 
-    assert_eq!(tools.len(), 14);
+    assert_eq!(tools.len(), 17);
 
     // Verify all tools are present
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -509,6 +509,9 @@ async fn test_tools_list() {
     assert!(tool_names.contains(&"debugger_stack_trace"));
     assert!(tool_names.contains(&"debugger_evaluate"));
     assert!(tool_names.contains(&"debugger_disconnect"));
+    assert!(tool_names.contains(&"debugger_run_to_crash"));
+    assert!(tool_names.contains(&"debugger_snapshot_at"));
+    assert!(tool_names.contains(&"debugger_trace_function"));
 }
 
 /// Test that validates Python MCP server works with Claude Code CLI

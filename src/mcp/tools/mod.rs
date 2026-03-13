@@ -63,6 +63,8 @@ pub struct RemoveBreakpointArgs {
 #[serde(rename_all = "camelCase")]
 pub struct ContinueArgs {
     pub session_id: String,
+    pub wait_for_stop: Option<bool>,
+    pub timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -71,6 +73,7 @@ pub struct StackTraceArgs {
     pub session_id: String,
     pub format: Option<String>,
     pub limit: Option<i32>,
+    pub include_variables: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -121,12 +124,163 @@ pub struct StepArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct RunToCrashArgs {
+    pub language: String,
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub exception_filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotAtArgs {
+    pub session_id: String,
+    pub source_path: String,
+    pub line: i32,
+    #[serde(default)]
+    pub expressions: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TraceFunctionArgs {
+    pub session_id: String,
+    #[serde(default)]
+    pub expressions: Vec<String>,
+    pub max_steps: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetOutputArgs {
     pub session_id: String,
     pub category: Option<String>,
     pub search: Option<String>,
     pub limit: Option<usize>,
     pub since_line: Option<usize>,
+}
+
+async fn wait_for_stop_enriched(
+    session: &crate::debug::session::DebugSession,
+    timeout_ms: u64,
+) -> crate::Result<Value> {
+    let timeout = tokio::time::Duration::from_millis(timeout_ms);
+    let start = tokio::time::Instant::now();
+
+    loop {
+        let state = session.get_state().await;
+
+        if let crate::debug::state::DebugState::Stopped { thread_id, reason } = state {
+            let mut result = json!({
+                "state": "Stopped",
+                "threadId": thread_id,
+                "reason": reason
+            });
+
+            let ctx = build_stop_context(session, Some(3)).await;
+            if let Value::Object(map) = ctx {
+                for (k, v) in map {
+                    result[k] = v;
+                }
+            }
+
+            return Ok(result);
+        }
+
+        if matches!(state, crate::debug::state::DebugState::Terminated) {
+            return Ok(json!({
+                "state": "Terminated",
+                "reason": "Program exited"
+            }));
+        }
+
+        if let crate::debug::state::DebugState::Failed { error } = state {
+            return Err(crate::Error::Dap(format!("Session failed: {}", error)));
+        }
+
+        if start.elapsed() > timeout {
+            return Err(crate::Error::InvalidState(format!(
+                "Timeout waiting for program to stop ({}ms)",
+                timeout_ms
+            )));
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn build_stop_context(
+    session: &crate::debug::session::DebugSession,
+    stack_limit: Option<i32>,
+) -> Value {
+    let stack_limit = stack_limit.unwrap_or(3);
+    let mut ctx = json!({});
+
+    // Stack trace with timeout
+    let stack_timeout = tokio::time::Duration::from_secs(3);
+    if let Ok(Ok(frames)) = tokio::time::timeout(stack_timeout, session.stack_trace(Some(stack_limit))).await {
+        ctx["stackTrace"] = json!(format_stack_frames(&frames, &session.program));
+
+        if let Some(top) = frames.first() {
+            ctx["topFrame"] = json!({
+                "id": top.id,
+                "name": top.name,
+                "line": top.line,
+                "source": top.source
+            });
+
+            // Source context with timeout
+            if let Some(src) = &top.source {
+                if let Some(path) = &src.path {
+                    let src_timeout = tokio::time::Duration::from_secs(1);
+                    if let Ok(Some(source_ctx)) = tokio::time::timeout(src_timeout, read_source_context(path, top.line, 5)).await {
+                        ctx["sourceContext"] = json!(source_ctx);
+                    }
+                }
+            }
+
+            // Local variables with timeout
+            let vars_timeout = tokio::time::Duration::from_secs(5);
+            if let Ok(Ok(vars)) = tokio::time::timeout(vars_timeout, session.get_local_variables(top.id, 1)).await {
+                let var_list: Vec<Value> = vars.iter().map(|v| {
+                    json!({
+                        "name": v.name,
+                        "value": v.value,
+                        "type": v.type_
+                    })
+                }).collect();
+                ctx["localVariables"] = json!(var_list);
+            }
+        }
+    }
+
+    ctx
+}
+
+async fn read_source_context(path: &str, line: i32, context_lines: i32) -> Option<String> {
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let lines: Vec<&str> = content.lines().collect();
+    let line_idx = (line - 1) as usize;
+    if line_idx >= lines.len() {
+        return None;
+    }
+
+    let start = line_idx.saturating_sub(context_lines as usize);
+    let end = (line_idx + context_lines as usize + 1).min(lines.len());
+
+    let formatted: Vec<String> = (start..end)
+        .map(|i| {
+            let line_num = i + 1;
+            let marker = if i == line_idx { " >" } else { "  " };
+            format!("{} {:>4} | {}", marker, line_num, lines[i])
+        })
+        .collect();
+
+    Some(formatted.join("\n"))
 }
 
 fn format_stack_frames(
@@ -196,6 +350,9 @@ impl ToolsHandler {
             "debugger_step_into" => self.debugger_step_into(arguments).await,
             "debugger_step_out" => self.debugger_step_out(arguments).await,
             "debugger_get_output" => self.debugger_get_output(arguments).await,
+            "debugger_run_to_crash" => self.debugger_run_to_crash(arguments).await,
+            "debugger_snapshot_at" => self.debugger_snapshot_at(arguments).await,
+            "debugger_trace_function" => self.debugger_trace_function(arguments).await,
             _ => Err(Error::MethodNotFound(name.to_string())),
         }
     }
@@ -458,6 +615,12 @@ impl ToolsHandler {
 
         session.continue_execution().await?;
 
+        if args.wait_for_stop.unwrap_or(false) {
+            let timeout_ms = args.timeout_ms.unwrap_or(30_000);
+            let result = wait_for_stop_enriched(&session, timeout_ms).await?;
+            return Ok(result);
+        }
+
         Ok(json!({
             "status": "continued"
         }))
@@ -484,10 +647,58 @@ impl ToolsHandler {
         };
         let frames = session.stack_trace(levels).await?;
 
+        let include_vars = args.include_variables.unwrap_or(false);
+
         if args.format.as_deref() != Some("json") {
-            Ok(json!({ "stackTrace": format_stack_frames(&frames, &session.program) }))
+            let mut result = json!({ "stackTrace": format_stack_frames(&frames, &session.program) });
+
+            if include_vars {
+                if let Some(top) = frames.first() {
+                    let vars_timeout = tokio::time::Duration::from_secs(5);
+                    if let Ok(Ok(vars)) = tokio::time::timeout(vars_timeout, session.get_local_variables(top.id, 1)).await {
+                        let var_list: Vec<Value> = vars.iter().map(|v| json!({"name": v.name, "value": v.value, "type": v.type_})).collect();
+                        result["localVariables"] = json!(var_list);
+                    }
+                    if let Some(src) = &top.source {
+                        if let Some(path) = &src.path {
+                            if let Ok(Some(src_ctx)) = tokio::time::timeout(tokio::time::Duration::from_secs(1), read_source_context(path, top.line, 5)).await {
+                                result["sourceContext"] = json!(src_ctx);
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(result)
         } else {
-            Ok(json!({ "stackFrames": frames }))
+            let mut result = json!({ "stackFrames": frames });
+
+            if include_vars {
+                for frame in &frames {
+                    let vars_timeout = tokio::time::Duration::from_secs(5);
+                    if let Ok(Ok(vars)) = tokio::time::timeout(vars_timeout, session.get_local_variables(frame.id, 1)).await {
+                        let var_list: Vec<Value> = vars.iter().map(|v| json!({"name": v.name, "value": v.value, "type": v.type_})).collect();
+                        if let Some(frame_obj) = result["stackFrames"].as_array_mut() {
+                            if let Some(f) = frame_obj.iter_mut().find(|f| f["id"] == frame.id) {
+                                f["localVariables"] = json!(var_list);
+                            }
+                        }
+                    }
+                    if let Some(src) = &frame.source {
+                        if let Some(path) = &src.path {
+                            if let Ok(Some(src_ctx)) = tokio::time::timeout(tokio::time::Duration::from_secs(1), read_source_context(path, frame.line, 5)).await {
+                                if let Some(frame_obj) = result["stackFrames"].as_array_mut() {
+                                    if let Some(f) = frame_obj.iter_mut().find(|f| f["id"] == frame.id) {
+                                        f["sourceContext"] = json!(src_ctx);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(result)
         }
     }
 
@@ -534,9 +745,12 @@ impl ToolsHandler {
                     "reason": reason
                 });
 
-                if let Ok(frames) = session.stack_trace(Some(3)).await {
-                    result["stackTrace"] =
-                        json!(format_stack_frames(&frames, &session.program));
+                let ctx = build_stop_context(&session, Some(3)).await;
+                // Merge context fields into result
+                if let Value::Object(map) = ctx {
+                    for (k, v) in map {
+                        result[k] = v;
+                    }
                 }
 
                 return Ok(result);
@@ -633,10 +847,9 @@ impl ToolsHandler {
         let thread_id = args.thread_id.unwrap_or(thread_id);
         session.step_over(thread_id).await?;
 
-        Ok(json!({
-            "status": "stepping",
-            "threadId": thread_id
-        }))
+        // Auto-wait for stop and return enriched context
+        let result = wait_for_stop_enriched(&session, 30_000).await?;
+        Ok(result)
     }
 
     async fn debugger_step_into(&self, arguments: Value) -> Result<Value> {
@@ -659,10 +872,8 @@ impl ToolsHandler {
         let thread_id = args.thread_id.unwrap_or(thread_id);
         session.step_into(thread_id).await?;
 
-        Ok(json!({
-            "status": "stepping",
-            "threadId": thread_id
-        }))
+        let result = wait_for_stop_enriched(&session, 30_000).await?;
+        Ok(result)
     }
 
     async fn debugger_step_out(&self, arguments: Value) -> Result<Value> {
@@ -685,9 +896,214 @@ impl ToolsHandler {
         let thread_id = args.thread_id.unwrap_or(thread_id);
         session.step_out(thread_id).await?;
 
+        let result = wait_for_stop_enriched(&session, 30_000).await?;
+        Ok(result)
+    }
+
+    async fn debugger_run_to_crash(&self, arguments: Value) -> Result<Value> {
+        let args: RunToCrashArgs = serde_json::from_value(arguments)?;
+
+        let validated_program = security::validate_source_path(&args.program, None)?;
+        let program = validated_program
+            .to_str()
+            .ok_or_else(|| Error::Internal("Non-UTF8 program path".to_string()))?
+            .to_string();
+
+        let validated_cwd = if let Some(cwd_path) = &args.cwd {
+            Some(security::validate_directory_path(cwd_path)?
+                .to_str()
+                .ok_or_else(|| Error::Internal("Non-UTF8 cwd path".to_string()))?
+                .to_string())
+        } else {
+            None
+        };
+
+        let manager = self.session_manager.read().await;
+        let session_id = manager
+            .create_session(&args.language, program, args.args, validated_cwd, true, args.env)
+            .await?;
+
+        let session = manager.get_session(&session_id).await?;
+
+        // Wait for stop on entry
+        let timeout = tokio::time::Duration::from_secs(30);
+        let start = tokio::time::Instant::now();
+        loop {
+            let state = session.get_state().await;
+            if matches!(state, crate::debug::state::DebugState::Stopped { .. }) {
+                break;
+            }
+            if matches!(state, crate::debug::state::DebugState::Terminated) {
+                return Err(Error::Dap("Program terminated before exception breakpoints could be set".into()));
+            }
+            if let crate::debug::state::DebugState::Failed { error } = state {
+                return Err(Error::Dap(format!("Session failed: {}", error)));
+            }
+            if start.elapsed() > timeout {
+                return Err(Error::InvalidState("Timeout waiting for entry stop".into()));
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+
+        // Set exception breakpoints
+        let filter = args.exception_filter.unwrap_or_else(|| "uncaught".to_string());
+        session.set_exception_breakpoints(vec![filter]).await?;
+
+        // Continue and wait for crash or termination
+        session.continue_execution().await?;
+        let result = wait_for_stop_enriched(&session, 60_000).await?;
+
+        // Add session ID to result
+        let mut result = result;
+        result["sessionId"] = json!(session_id);
+        Ok(result)
+    }
+
+    async fn debugger_snapshot_at(&self, arguments: Value) -> Result<Value> {
+        let args: SnapshotAtArgs = serde_json::from_value(arguments)?;
+
+        let validated_source = security::validate_source_path(&args.source_path, None)?;
+        let source_path = validated_source
+            .to_str()
+            .ok_or_else(|| Error::Internal("Non-UTF8 source path".to_string()))?
+            .to_string();
+
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+
+        // Set temporary breakpoint
+        session.set_breakpoint(source_path.clone(), args.line, None, None, None).await?;
+
+        // Continue if stopped
+        let state = session.get_state().await;
+        if matches!(state, crate::debug::state::DebugState::Stopped { .. }) {
+            session.continue_execution().await?;
+        }
+
+        // Wait for stop at breakpoint
+        let mut result = wait_for_stop_enriched(&session, 30_000).await?;
+
+        // Evaluate requested expressions
+        if !args.expressions.is_empty() {
+            let mut expr_results = Vec::new();
+            for expr in &args.expressions {
+                match session.evaluate(expr, None, None).await {
+                    Ok(val) => expr_results.push(json!({"expression": expr, "result": val})),
+                    Err(e) => expr_results.push(json!({"expression": expr, "error": e.to_string()})),
+                }
+            }
+            result["evaluatedExpressions"] = json!(expr_results);
+        }
+
+        // Remove the temporary breakpoint
+        let _ = session.remove_breakpoint(source_path, args.line).await;
+
+        result["sessionId"] = json!(args.session_id);
+        Ok(result)
+    }
+
+    async fn debugger_trace_function(&self, arguments: Value) -> Result<Value> {
+        let args: TraceFunctionArgs = serde_json::from_value(arguments)?;
+
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+
+        let max_steps = args.max_steps.unwrap_or(50).min(200) as usize;
+
+        // Get initial frame info
+        let initial_frames = session.stack_trace(Some(1)).await?;
+        let initial_frame = initial_frames
+            .first()
+            .ok_or_else(|| Error::InvalidState("No stack frames available".to_string()))?;
+        let initial_name = initial_frame.name.clone();
+        let initial_source = initial_frame.source.as_ref().and_then(|s| s.path.clone());
+
+        let mut trace = Vec::new();
+
+        for _ in 0..max_steps {
+            let state = session.get_state().await;
+            if !matches!(state, crate::debug::state::DebugState::Stopped { .. }) {
+                break;
+            }
+
+            let frames = session.stack_trace(Some(1)).await?;
+            let frame = match frames.first() {
+                Some(f) => f,
+                None => break,
+            };
+
+            // Stop if we've left the function
+            let current_source = frame.source.as_ref().and_then(|s| s.path.clone());
+            if frame.name != initial_name || current_source != initial_source {
+                break;
+            }
+
+            // Record current state
+            let mut entry = json!({
+                "line": frame.line,
+                "name": frame.name,
+            });
+
+            // Get source line
+            if let Some(path) = &current_source {
+                if let Some(src_ctx) = read_source_context(path, frame.line, 0).await {
+                    entry["source"] = json!(src_ctx);
+                }
+            }
+
+            // Evaluate expressions
+            if !args.expressions.is_empty() {
+                let mut values = json!({});
+                for expr in &args.expressions {
+                    match session.evaluate(expr, Some(frame.id), None).await {
+                        Ok(val) => values[expr] = json!(val),
+                        Err(e) => values[expr] = json!(format!("<error: {}>", e)),
+                    }
+                }
+                entry["values"] = values;
+            }
+
+            trace.push(entry);
+
+            // Step over
+            let thread_id = if let crate::debug::state::DebugState::Stopped { thread_id, .. } = session.get_state().await {
+                thread_id
+            } else {
+                break;
+            };
+            session.step_over(thread_id).await?;
+
+            // Wait for step to complete
+            let step_timeout = tokio::time::Duration::from_secs(10);
+            let step_start = tokio::time::Instant::now();
+            loop {
+                let s = session.get_state().await;
+                if matches!(s, crate::debug::state::DebugState::Stopped { .. }) {
+                    break;
+                }
+                if matches!(s, crate::debug::state::DebugState::Terminated) {
+                    return Ok(json!({
+                        "sessionId": args.session_id,
+                        "trace": trace,
+                        "reason": "terminated"
+                    }));
+                }
+                if step_start.elapsed() > step_timeout {
+                    return Ok(json!({
+                        "sessionId": args.session_id,
+                        "trace": trace,
+                        "reason": "step_timeout"
+                    }));
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
+        }
+
         Ok(json!({
-            "status": "stepping",
-            "threadId": thread_id
+            "sessionId": args.session_id,
+            "trace": trace,
+            "steps": trace.len(),
+            "reason": "completed"
         }))
     }
 
@@ -733,7 +1149,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_start",
                 "title": "Start Debugging Session",
-                "description": "Starts a new debugging session for a program.\n\n⭐ RECOMMENDED: Pass breakpoints directly to avoid multiple round-trips:\n  debugger_start({program: \"app.py\", breakpoints: [{sourcePath: \"/abs/path/app.py\", line: 20}]})\n  debugger_wait_for_stop()  // Program runs and stops at breakpoint\n\nWhen breakpoints are provided:\n- The program automatically pauses on entry, sets all breakpoints, then continues\n- If stopOnEntry is also true, the program stays paused after setting breakpoints\n- Returns the list of set breakpoints with verification status\n\nWithout breakpoints, use the manual workflow:\n1. debugger_start({program: \"app.py\", stopOnEntry: true})\n2. debugger_wait_for_stop()\n3. debugger_set_breakpoint({line: 20})\n4. debugger_continue()\n\nSEE ALSO: debugger_wait_for_stop, debugger_set_breakpoint",
+                "description": "Starts a new debugging session for a program.\n\nDEBUGGING WORKFLOW — Choose the best approach:\n1. For crash investigation: use debugger_run_to_crash (single call, returns crash context)\n2. For state inspection at a line: use debugger_start + debugger_snapshot_at\n3. For stepping: step_over/into/out now return full context automatically\n\n⭐ RECOMMENDED: Pass breakpoints directly to avoid multiple round-trips:\n  debugger_start({program: \"app.py\", breakpoints: [{sourcePath: \"/abs/path/app.py\", line: 20}]})\n  debugger_wait_for_stop()  // Returns stack trace, variables, source context\n\nAll state-changing tools now return enriched context (stack, variables, source) automatically.\n\nSEE ALSO: debugger_run_to_crash, debugger_snapshot_at, debugger_trace_function",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -879,13 +1295,21 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_continue",
                 "title": "Continue Execution",
-                "description": "Resumes program execution after being paused (e.g., at a breakpoint or entry point). Execution continues until the next breakpoint, exception, or program termination.\n\nWORKFLOW:\n1. Session must be in 'Stopped' state (verify with debugger_session_state)\n2. Call this tool to resume execution\n3. Poll debugger_session_state to detect when execution stops again\n4. When state returns to 'Stopped', check details.reason:\n   - 'breakpoint': Hit a breakpoint (use debugger_stack_trace to inspect)\n   - 'exception': Uncaught exception occurred\n   - 'pause': Manual pause requested\n   - 'step': Completed a step operation\n\nTIMING: Returns in <10ms (but program continues running asynchronously)\n\nTIP: After calling continue, immediately poll debugger_session_state in a loop to detect when the program stops again.\n\nRETURNS: {\"status\": \"continued\"}\n\nSEE ALSO: debugger_stack_trace (inspect state when stopped), debugger://workflows (execution control patterns)",
+                "description": "Resumes program execution after being paused.\n\n⭐ RECOMMENDED: Use waitForStop: true to get full context in a single call:\n  debugger_continue({sessionId, waitForStop: true})\n  → Returns stack trace, local variables, and source context when stopped\n\nWithout waitForStop, returns immediately and you must poll separately.\n\nWhen stopped, check reason: 'breakpoint', 'exception', 'pause', 'step'\n\nSEE ALSO: debugger_run_to_crash (for crash investigation), debugger_snapshot_at (for state inspection)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "sessionId": {
                             "type": "string",
                             "description": "Session ID from debugger_start"
+                        },
+                        "waitForStop": {
+                            "type": "boolean",
+                            "description": "If true, blocks until program stops and returns enriched context (stack trace, variables, source). Recommended for typical debugging workflows. Default: false"
+                        },
+                        "timeoutMs": {
+                            "type": "integer",
+                            "description": "Timeout in ms when waitForStop is true (default: 30000)"
                         }
                     },
                     "required": ["sessionId"]
@@ -919,6 +1343,10 @@ impl ToolsHandler {
                         "limit": {
                             "type": "integer",
                             "description": "Maximum number of stack frames to return. Defaults to 20. Use 0 to return all frames."
+                        },
+                        "includeVariables": {
+                            "type": "boolean",
+                            "description": "If true, includes local variables and source context for each frame. Saves separate calls to debugger_evaluate."
                         }
                     },
                     "required": ["sessionId"]
@@ -1052,7 +1480,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_step_over",
                 "title": "Step Over (Next Line)",
-                "description": "Executes the current line and stops at the next line. Does NOT step into function calls.\n\nREQUIRES: Program must be stopped (at breakpoint, entry, or previous step)\n\nWORKFLOW:\n1. Ensure program is stopped\n2. Call this tool to execute one line\n3. Use debugger_wait_for_stop to wait for the step to complete\n4. Inspect state with debugger_stack_trace and debugger_evaluate\n\nTIMING: Returns quickly; use debugger_wait_for_stop to detect completion\n\nSEE ALSO: debugger_step_into (to step into functions), debugger_step_out (to step out)",
+                "description": "Executes the current line and stops at the next line. Does NOT step into function calls.\n\n⭐ AUTO-ENRICHED: Returns full context automatically (no separate wait/inspect needed):\n- Stack trace with frame IDs\n- Local variables for current frame\n- Source code context (±5 lines)\n\nREQUIRES: Program must be stopped\n\nSEE ALSO: debugger_step_into (enter functions), debugger_step_out (exit function), debugger_trace_function (step through entire function)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1071,7 +1499,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_step_into",
                 "title": "Step Into (Enter Function)",
-                "description": "Steps into function calls on the current line. If no function call, behaves like step_over.\n\nREQUIRES: Program must be stopped\n\nUSEFUL FOR: Debugging function implementations line by line\n\nWORKFLOW: Same as debugger_step_over\n\nSEE ALSO: debugger_step_over (to skip functions), debugger_step_out (to exit function)",
+                "description": "Steps into function calls on the current line. If no function call, behaves like step_over.\n\n⭐ AUTO-ENRICHED: Returns full context automatically (stack trace, variables, source).\n\nREQUIRES: Program must be stopped\n\nSEE ALSO: debugger_step_over (skip functions), debugger_step_out (exit function)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1090,7 +1518,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_step_out",
                 "title": "Step Out (Exit Function)",
-                "description": "Continues execution until the current function returns, then stops at the caller.\n\nREQUIRES: Program must be stopped inside a function\n\nUSEFUL FOR: Quickly exiting from deep call stacks\n\nWORKFLOW: Same as debugger_step_over\n\nSEE ALSO: debugger_step_into (to enter function), debugger_step_over (to skip line)",
+                "description": "Continues execution until the current function returns, then stops at the caller.\n\n⭐ AUTO-ENRICHED: Returns full context automatically (stack trace, variables, source).\n\nREQUIRES: Program must be stopped inside a function\n\nSEE ALSO: debugger_step_into (enter function), debugger_step_over (next line)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1138,6 +1566,95 @@ impl ToolsHandler {
                     "required": ["sessionId"]
                 }
             }),
+            json!({
+                "name": "debugger_run_to_crash",
+                "title": "Run Program Until It Crashes",
+                "description": "⭐ RECOMMENDED for bug investigation. Launches a program with exception breakpoints, runs until it crashes, and returns full crash context in a single call.\n\nRETURNS (on crash): Stack trace, local variables, source context, exception info, session ID\nRETURNS (clean exit): Terminated state with program output\n\nEQUIVALENT TO (but in 1 call instead of 5+):\n  debugger_start() → wait → set_exception_breakpoints → continue → wait → stack_trace → evaluate\n\nSEE ALSO: debugger_snapshot_at (inspect state at specific line), debugger_start (manual control)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "language": {
+                            "type": "string",
+                            "description": "Programming language (e.g., 'python', 'ruby', 'javascript', 'rust')"
+                        },
+                        "program": {
+                            "type": "string",
+                            "description": "Path to the program file to debug"
+                        },
+                        "args": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Command-line arguments"
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Working directory"
+                        },
+                        "env": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" },
+                            "description": "Environment variables"
+                        },
+                        "exceptionFilter": {
+                            "type": "string",
+                            "description": "Exception filter: 'uncaught' (default) or 'raised' (all exceptions including caught)"
+                        }
+                    },
+                    "required": ["language", "program"]
+                }
+            }),
+            json!({
+                "name": "debugger_snapshot_at",
+                "title": "Capture State at Line",
+                "description": "Sets a temporary breakpoint, runs to it, captures full debug context + evaluates expressions, then removes the breakpoint. Single-call state inspection.\n\nRETURNS: Stack trace, local variables, source context, evaluated expressions, session ID\n\nEQUIVALENT TO (but in 1 call instead of 6+):\n  set_breakpoint → continue → wait → stack_trace → evaluate × N → remove_breakpoint\n\nSEE ALSO: debugger_run_to_crash (crash investigation), debugger_trace_function (step through function)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        },
+                        "sourcePath": {
+                            "type": "string",
+                            "description": "Absolute path to the source file"
+                        },
+                        "line": {
+                            "type": "integer",
+                            "description": "Line number to capture state at"
+                        },
+                        "expressions": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Expressions to evaluate when stopped (e.g., ['x', 'len(items)', 'self.name'])"
+                        }
+                    },
+                    "required": ["sessionId", "sourcePath", "line"]
+                }
+            }),
+            json!({
+                "name": "debugger_trace_function",
+                "title": "Trace Function Execution",
+                "description": "Steps through the current function line by line, recording execution trace with expression values at each step. Stops when the function returns or max steps reached.\n\nREQUIRES: Program must be stopped at or inside the target function.\n\nRETURNS: Array of trace entries, each with line number, source text, and expression values.\n\nUSEFUL FOR: Understanding control flow, watching how variables change through a function.\n\nSEE ALSO: debugger_step_over (single step), debugger_snapshot_at (capture at one point)",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        },
+                        "expressions": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Expressions to evaluate at each step (e.g., ['n', 'result'])"
+                        },
+                        "maxSteps": {
+                            "type": "integer",
+                            "description": "Maximum steps to trace (default: 50, max: 200)"
+                        }
+                    },
+                    "required": ["sessionId"]
+                }
+            }),
         ]
     }
 }
@@ -1147,104 +1664,86 @@ mod tests {
     use super::*;
     use crate::debug::SessionManager;
 
-    #[test]
-    fn test_debugger_start_args_deserialization() {
-        let json = json!({
-            "language": "python",
-            "program": "/path/to/script.py",
-            "args": ["arg1", "arg2"],
-            "cwd": "/working/dir"
-        });
+    #[tokio::test]
+    async fn test_read_source_context() {
+        let dir = std::env::temp_dir().join("debugger_mcp_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_source.py");
+        std::fs::write(&path, "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\nline 7\n").unwrap();
 
-        let args: DebuggerStartArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.language, "python");
-        assert_eq!(args.program, "/path/to/script.py");
-        assert_eq!(args.args.len(), 2);
-        assert_eq!(args.cwd, Some("/working/dir".to_string()));
+        let result = read_source_context(path.to_str().unwrap(), 4, 2).await;
+        assert!(result.is_some());
+        let ctx = result.unwrap();
+        assert!(ctx.contains(" >    4 |"), "Should mark line 4 as current, got: {}", ctx);
+        assert!(ctx.contains("line 2"), "Should include context before");
+        assert!(ctx.contains("line 6"), "Should include context after");
+        assert!(!ctx.contains("line 1"), "Should not include line 1 with context=2");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_read_source_context_nonexistent_file() {
+        let result = read_source_context("/nonexistent/path.py", 1, 5).await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_read_source_context_line_out_of_range() {
+        let dir = std::env::temp_dir().join("debugger_mcp_test");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("test_short.py");
+        std::fs::write(&path, "only one line\n").unwrap();
+
+        let result = read_source_context(path.to_str().unwrap(), 999, 5).await;
+        assert!(result.is_none());
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
-    fn test_debugger_start_args_without_cwd() {
-        let json = json!({
-            "language": "python",
-            "program": "test.py",
-            "args": []
-        });
+    fn test_compound_tools_in_schema() {
+        let tools = ToolsHandler::list_tools();
+        let find_tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap();
 
-        let args: DebuggerStartArgs = serde_json::from_value(json).unwrap();
-        assert!(args.cwd.is_none());
-        assert!(args.args.is_empty());
-    }
+        // Verify compound tool schemas have required fields
+        let rtc = find_tool("debugger_run_to_crash");
+        let required: Vec<&str> = rtc["inputSchema"]["required"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(required.contains(&"language"));
+        assert!(required.contains(&"program"));
 
-    #[test]
-    fn test_set_breakpoint_args_deserialization() {
-        let json = json!({
-            "sessionId": "session-123",
-            "sourcePath": "/path/to/file.py",
-            "line": 42
-        });
+        let snap = find_tool("debugger_snapshot_at");
+        let required: Vec<&str> = snap["inputSchema"]["required"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(required.contains(&"sessionId"));
+        assert!(required.contains(&"sourcePath"));
+        assert!(required.contains(&"line"));
 
-        let args: SetBreakpointArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.session_id, "session-123");
-        assert_eq!(args.source_path, "/path/to/file.py");
-        assert_eq!(args.line, 42);
-    }
+        let trace = find_tool("debugger_trace_function");
+        let required: Vec<&str> = trace["inputSchema"]["required"].as_array().unwrap()
+            .iter().filter_map(|v| v.as_str()).collect();
+        assert!(required.contains(&"sessionId"));
 
-    #[test]
-    fn test_continue_args_deserialization() {
-        let json = json!({"sessionId": "test-session"});
-        let args: ContinueArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.session_id, "test-session");
-    }
+        // Verify continue has new waitForStop parameter
+        let cont = find_tool("debugger_continue");
+        assert!(cont["inputSchema"]["properties"]["waitForStop"].is_object());
+        assert!(cont["inputSchema"]["properties"]["timeoutMs"].is_object());
 
-    #[test]
-    fn test_stack_trace_args_deserialization() {
-        let json = json!({"sessionId": "trace-session"});
-        let args: StackTraceArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.session_id, "trace-session");
-    }
-
-    #[test]
-    fn test_evaluate_args_deserialization() {
-        let json = json!({
-            "sessionId": "eval-session",
-            "expression": "x + y",
-            "frameId": 5
-        });
-
-        let args: EvaluateArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.session_id, "eval-session");
-        assert_eq!(args.expression, "x + y");
-        assert_eq!(args.frame_id, Some(5));
-    }
-
-    #[test]
-    fn test_evaluate_args_without_frame_id() {
-        let json = json!({
-            "sessionId": "eval-session",
-            "expression": "x + y"
-        });
-
-        let args: EvaluateArgs = serde_json::from_value(json).unwrap();
-        assert!(args.frame_id.is_none());
-    }
-
-    #[test]
-    fn test_disconnect_args_deserialization() {
-        let json = json!({"sessionId": "disconnect-session"});
-        let args: DisconnectArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.session_id, "disconnect-session");
+        // Verify stack_trace has includeVariables
+        let st = find_tool("debugger_stack_trace");
+        assert!(st["inputSchema"]["properties"]["includeVariables"].is_object());
     }
 
     #[test]
     fn test_list_tools() {
         let tools = ToolsHandler::list_tools();
-        assert_eq!(tools.len(), 14);
+        assert_eq!(tools.len(), 17);
 
         // Verify tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-        // Original tools
+        // Core tools
         assert!(tool_names.contains(&"debugger_start"));
         assert!(tool_names.contains(&"debugger_session_state"));
         assert!(tool_names.contains(&"debugger_set_breakpoint"));
@@ -1252,8 +1751,6 @@ mod tests {
         assert!(tool_names.contains(&"debugger_stack_trace"));
         assert!(tool_names.contains(&"debugger_evaluate"));
         assert!(tool_names.contains(&"debugger_disconnect"));
-
-        // New tools
         assert!(tool_names.contains(&"debugger_wait_for_stop"));
         assert!(tool_names.contains(&"debugger_list_breakpoints"));
         assert!(tool_names.contains(&"debugger_remove_breakpoint"));
@@ -1261,6 +1758,11 @@ mod tests {
         assert!(tool_names.contains(&"debugger_step_into"));
         assert!(tool_names.contains(&"debugger_step_out"));
         assert!(tool_names.contains(&"debugger_get_output"));
+
+        // Compound tools
+        assert!(tool_names.contains(&"debugger_run_to_crash"));
+        assert!(tool_names.contains(&"debugger_snapshot_at"));
+        assert!(tool_names.contains(&"debugger_trace_function"));
     }
 
     #[test]
@@ -1317,197 +1819,6 @@ mod tests {
         // Invalid JSON for debugger_start
         let result = handler
             .handle_tool("debugger_start", json!({"invalid": "data"}))
-            .await;
-        assert!(result.is_err());
-    }
-
-    // Phase 6: Error path tests for missing required fields and invalid types
-
-    #[test]
-    fn test_debugger_start_missing_language() {
-        let json = json!({
-            "program": "/path/to/script.py"
-        });
-
-        let result = serde_json::from_value::<DebuggerStartArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_debugger_start_missing_program() {
-        let json = json!({
-            "language": "python"
-        });
-
-        let result = serde_json::from_value::<DebuggerStartArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_debugger_start_invalid_args_type() {
-        let json = json!({
-            "language": "python",
-            "program": "test.py",
-            "args": "not an array"  // Should be array, not string
-        });
-
-        let result = serde_json::from_value::<DebuggerStartArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_set_breakpoint_missing_session_id() {
-        let json = json!({
-            "sourcePath": "/path/to/file.py",
-            "line": 42
-        });
-
-        let result = serde_json::from_value::<SetBreakpointArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_set_breakpoint_missing_source_path() {
-        let json = json!({
-            "sessionId": "session-123",
-            "line": 42
-        });
-
-        let result = serde_json::from_value::<SetBreakpointArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_set_breakpoint_missing_line() {
-        let json = json!({
-            "sessionId": "session-123",
-            "sourcePath": "/path/to/file.py"
-        });
-
-        let result = serde_json::from_value::<SetBreakpointArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_set_breakpoint_invalid_line_type() {
-        let json = json!({
-            "sessionId": "session-123",
-            "sourcePath": "/path/to/file.py",
-            "line": "not a number"  // Should be integer
-        });
-
-        let result = serde_json::from_value::<SetBreakpointArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_continue_args_missing_session_id() {
-        let json = json!({});
-
-        let result = serde_json::from_value::<ContinueArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_stack_trace_args_missing_session_id() {
-        let json = json!({});
-
-        let result = serde_json::from_value::<StackTraceArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_evaluate_missing_session_id() {
-        let json = json!({
-            "expression": "x + y"
-        });
-
-        let result = serde_json::from_value::<EvaluateArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_evaluate_missing_expression() {
-        let json = json!({
-            "sessionId": "eval-session"
-        });
-
-        let result = serde_json::from_value::<EvaluateArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_evaluate_invalid_frame_id_type() {
-        let json = json!({
-            "sessionId": "eval-session",
-            "expression": "x + y",
-            "frameId": "not a number"  // Should be integer
-        });
-
-        let result = serde_json::from_value::<EvaluateArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_disconnect_missing_session_id() {
-        let json = json!({});
-
-        let result = serde_json::from_value::<DisconnectArgs>(json);
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_tool_debugger_start_invalid_json() {
-        let manager = Arc::new(RwLock::new(SessionManager::new()));
-        let handler = ToolsHandler::new(manager);
-
-        // Missing required fields
-        let result = handler
-            .handle_tool("debugger_start", json!({"language": "python"}))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_tool_set_breakpoint_invalid_json() {
-        let manager = Arc::new(RwLock::new(SessionManager::new()));
-        let handler = ToolsHandler::new(manager);
-
-        // Missing required fields
-        let result = handler
-            .handle_tool("debugger_set_breakpoint", json!({"sessionId": "test"}))
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_tool_continue_invalid_json() {
-        let manager = Arc::new(RwLock::new(SessionManager::new()));
-        let handler = ToolsHandler::new(manager);
-
-        // Missing required fields
-        let result = handler.handle_tool("debugger_continue", json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_tool_stack_trace_invalid_json() {
-        let manager = Arc::new(RwLock::new(SessionManager::new()));
-        let handler = ToolsHandler::new(manager);
-
-        // Missing required fields
-        let result = handler.handle_tool("debugger_stack_trace", json!({})).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_handle_tool_evaluate_invalid_json() {
-        let manager = Arc::new(RwLock::new(SessionManager::new()));
-        let handler = ToolsHandler::new(manager);
-
-        // Missing required fields
-        let result = handler
-            .handle_tool("debugger_evaluate", json!({"sessionId": "test"}))
             .await;
         assert!(result.is_err());
     }

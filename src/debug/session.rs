@@ -1195,6 +1195,55 @@ impl DebugSession {
         client.stack_trace(thread_id, levels).await
     }
 
+    pub async fn scopes(&self, frame_id: i32) -> Result<Vec<crate::dap::types::Scope>> {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        client.scopes(frame_id).await
+    }
+
+    pub async fn set_exception_breakpoints(&self, filters: Vec<String>) -> Result<()> {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        client.set_exception_breakpoints(filters).await
+    }
+
+    pub async fn get_local_variables(&self, frame_id: i32, expand_depth: u32) -> Result<Vec<crate::dap::types::Variable>> {
+        let scopes = self.scopes(frame_id).await?;
+
+        let scope = match scopes.into_iter().find(|s| !s.expensive) {
+            Some(s) => s,
+            None => return Ok(Vec::new()),
+        };
+
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+
+        let timeout = std::time::Duration::from_secs(5);
+        let variables = tokio::time::timeout(timeout, client.variables(scope.variables_reference))
+            .await
+            .map_err(|_| crate::Error::Dap("Timeout fetching local variables".to_string()))??;
+
+        let mut result = Vec::new();
+        for var in variables.into_iter().take(20) {
+            if expand_depth > 0 && var.variables_reference > 0 {
+                let expand_timeout = std::time::Duration::from_secs(2);
+                match tokio::time::timeout(expand_timeout, client.expand_variable(var.variables_reference, expand_depth)).await {
+                    Ok(Ok(expanded)) if !expanded.is_empty() => {
+                        result.push(crate::dap::types::Variable {
+                            value: format!("{}\n{}", var.value, expanded),
+                            ..var
+                        });
+                    }
+                    _ => result.push(var),
+                }
+            } else {
+                result.push(var);
+            }
+        }
+
+        Ok(result)
+    }
+
     pub async fn evaluate(
         &self,
         expression: &str,

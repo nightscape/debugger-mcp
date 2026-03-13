@@ -218,6 +218,13 @@ pub struct StepInArguments {
     pub thread_id: i32,
 }
 
+/// SetExceptionBreakpoints Request Arguments
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetExceptionBreakpointsArguments {
+    pub filters: Vec<String>,
+}
+
 /// StepOut (Step Out) Request Arguments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -1378,6 +1378,38 @@ impl DapClient {
         Ok(body.stack_frames)
     }
 
+    pub async fn scopes(&self, frame_id: i32) -> Result<Vec<Scope>> {
+        let args = ScopesArguments { frame_id };
+
+        let timeout = std::time::Duration::from_secs(10);
+        let response = self
+            .send_request_with_timeout("scopes", Some(serde_json::to_value(args)?), timeout)
+            .await?;
+
+        if !response.success {
+            return Err(Error::Dap(format!(
+                "Scopes failed: {:?}",
+                response.message
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct ScopesResponse {
+            scopes: Vec<Scope>,
+        }
+
+        let body: ScopesResponse = response
+            .body
+            .ok_or_else(|| Error::Dap("No body in scopes response".to_string()))
+            .and_then(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| Error::Dap(format!("Failed to parse scopes: {}", e)))
+            })?;
+
+        Ok(body.scopes)
+    }
+
     pub async fn variables(&self, variables_reference: i32) -> Result<Vec<Variable>> {
         let args = VariablesArguments {
             variables_reference,
@@ -1419,6 +1451,26 @@ impl DapClient {
             })?;
 
         Ok(body.variables)
+    }
+
+    pub async fn set_exception_breakpoints(&self, filters: Vec<String>) -> Result<()> {
+        let args = SetExceptionBreakpointsArguments {
+            filters,
+        };
+
+        let timeout = std::time::Duration::from_secs(10);
+        let response = self
+            .send_request_with_timeout("setExceptionBreakpoints", Some(serde_json::to_value(args)?), timeout)
+            .await?;
+
+        if !response.success {
+            return Err(Error::Dap(format!(
+                "setExceptionBreakpoints failed: {:?}",
+                response.message
+            )));
+        }
+
+        Ok(())
     }
 
     pub async fn evaluate(
@@ -1528,7 +1580,7 @@ impl DapClient {
     }
 
     /// Recursively expand a variablesReference into a readable string
-    fn expand_variable(
+    pub(crate) fn expand_variable(
         &self,
         variables_reference: i32,
         max_depth: u32,
