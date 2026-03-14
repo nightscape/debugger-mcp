@@ -3,5 +3,10 @@
     "type": "stdio",
     "command": "npx",
     "args": ["-y", "@nightscape/debugger-mcp", "serve"]
+  },
+  "debugger_mcp_local": {
+    "type": "stdio",
+    "command": "/Users/martin/.cargo/bin/debugger_mcp",
+    "args": ["serve"]
   }
 }

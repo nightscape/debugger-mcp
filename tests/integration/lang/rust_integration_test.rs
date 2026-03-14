@@ -192,6 +192,7 @@ async fn test_rust_language_detection() {
             None,
             true,
             std::collections::HashMap::new(),
+            None,
         )
         .await;
 
@@ -253,6 +254,7 @@ async fn test_rust_adapter_spawning() {
             None,
             true,
             std::collections::HashMap::new(),
+            None,
         )
         .await
         .expect("Should create Rust session");

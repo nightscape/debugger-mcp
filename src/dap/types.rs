@@ -71,6 +71,8 @@ pub struct Capabilities {
     pub supports_set_variable: Option<bool>,
     pub supports_restart_frame: Option<bool>,
     pub supports_step_in_targets_request: Option<bool>,
+    pub supports_cancel_request: Option<bool>,
+    pub supports_data_breakpoints: Option<bool>,
 }
 
 /// Launch Request Arguments
@@ -230,6 +232,51 @@ pub struct SetExceptionBreakpointsArguments {
 #[serde(rename_all = "camelCase")]
 pub struct StepOutArguments {
     pub thread_id: i32,
+}
+
+/// DataBreakpointInfo Request Arguments
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataBreakpointInfoArguments {
+    /// Variable name or expression to get data breakpoint info for.
+    pub name: String,
+    /// Variables reference (from a scope or parent variable). Required when
+    /// `name` refers to a child variable rather than a top-level expression.
+    pub variables_reference: Option<i32>,
+    pub frame_id: Option<i32>,
+}
+
+/// DataBreakpointInfo Response body
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataBreakpointInfoBody {
+    /// Opaque identifier for the data. null if not available.
+    pub data_id: Option<String>,
+    /// Human-readable description of the data.
+    pub description: String,
+    /// Attribute lists the available access types for this data. If empty,
+    /// the data breakpoint cannot be set.
+    #[serde(default)]
+    pub access_types: Vec<String>,
+    pub can_persist: Option<bool>,
+}
+
+/// A single data breakpoint to set
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DataBreakpoint {
+    pub data_id: String,
+    /// Access type: "read", "write", or "readWrite"
+    pub access_type: Option<String>,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
+}
+
+/// SetDataBreakpoints Request Arguments
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDataBreakpointsArguments {
+    pub breakpoints: Vec<DataBreakpoint>,
 }
 
 #[cfg(test)]

@@ -38,6 +38,7 @@ impl SessionManager {
         cwd: Option<String>,
         stop_on_entry: bool,
         env: std::collections::HashMap<String, String>,
+        profile: Option<String>,
     ) -> Result<String> {
         // Type alias for STDIO adapter tuple: (command, args, adapter_id, launch_args, adapter_for_logging)
         type StdioAdapterTuple<'a> = (
@@ -308,32 +309,73 @@ impl SessionManager {
                     // Log adapter selection
                     adapter.log_selection();
 
-                    // Determine if program is a source file or already-compiled binary
-                    let binary_path = if program.ends_with(".rs") {
-                        // Source file - need to compile
-                        info!("🔨 [RUST] Compiling Rust source before debugging");
-
-                        RustAdapter::log_compilation_start(&program, false); // false = debug build
-                        let binary_path =
-                            RustAdapter::compile(&program, false)
-                                .await
-                                .inspect_err(|e| {
-                                    RustAdapter::log_compilation_error(e);
-                                })?;
-
-                        RustAdapter::log_compilation_success(&binary_path);
-                        binary_path
+                    // Detect project type and decide compilation strategy
+                    let use_cargo_integration = if program.ends_with(".rs") {
+                        matches!(
+                            RustAdapter::detect_project_type(&program),
+                            Ok(crate::adapters::rust::RustProjectType::CargoProject { .. })
+                        )
                     } else {
-                        // Assume it's already a compiled binary
+                        false
+                    };
+
+                    let (binary_path, launch_args) = if use_cargo_integration {
+                        // Cargo project: let CodeLLDB handle compilation via its cargo integration
+                        let cargo_root = match RustAdapter::detect_project_type(&program)? {
+                            crate::adapters::rust::RustProjectType::CargoProject { root, .. } => {
+                                root.to_str()
+                                    .ok_or_else(|| Error::Process("Non-UTF8 Cargo root path".to_string()))?
+                                    .to_string()
+                            }
+                            _ => unreachable!(),
+                        };
+                        info!("📦 [RUST] Using CodeLLDB Cargo integration for: {}", cargo_root);
+
+                        let launch = RustAdapter::cargo_launch_args(
+                            &cargo_root,
+                            &args,
+                            stop_on_entry,
+                            &env,
+                            profile.as_deref(),
+                        );
+                        // CodeLLDB resolves the binary path from cargo output
+                        (program.clone(), launch)
+                    } else if program.ends_with(".rs") {
+                        // Single .rs file: compile with rustc ourselves
+                        info!("🔨 [RUST] Compiling single Rust file before debugging");
+                        RustAdapter::log_compilation_start(&program, false);
+                        let binary = RustAdapter::compile(&program, false)
+                            .await
+                            .inspect_err(|e| {
+                                RustAdapter::log_compilation_error(e);
+                            })?;
+                        RustAdapter::log_compilation_success(&binary);
+
+                        let launch = RustAdapter::launch_args(
+                            &binary,
+                            &args,
+                            cwd.as_deref(),
+                            stop_on_entry,
+                            &env,
+                        );
+                        (binary, launch)
+                    } else {
+                        // Pre-compiled binary
                         info!("🎯 [RUST] Using pre-compiled binary: {}", program);
-                        program.clone()
+                        let launch = RustAdapter::launch_args(
+                            &program,
+                            &args,
+                            cwd.as_deref(),
+                            stop_on_entry,
+                            &env,
+                        );
+                        (program.clone(), launch)
                     };
 
                     // Log transport initialization
                     adapter.log_transport_init();
 
-                    // Step 2: Spawn CodeLLDB in TCP mode (like Ruby/Node.js/Go)
-                    // Based on nvim-dap: CodeLLDB uses TCP mode with --port argument
+                    // Spawn CodeLLDB in TCP mode
                     adapter.log_spawn_attempt();
                     let rust_session = RustAdapter::spawn(&binary_path, &args, stop_on_entry)
                         .await
@@ -345,13 +387,6 @@ impl SessionManager {
                     rust_session.log_connection_success_with_port();
 
                     let adapter_id = RustAdapter::adapter_id();
-                    let launch_args = RustAdapter::launch_args(
-                        &binary_path, // Use compiled binary path, not source
-                        &args,
-                        cwd.as_deref(),
-                        stop_on_entry,
-                        &env,
-                    );
 
                     // Create DAP client from socket (like Ruby/Go)
                     let client = DapClient::from_socket(rust_session.socket)
@@ -512,6 +547,7 @@ mod tests {
                 None,
                 false,
                 std::collections::HashMap::new(),
+                None,
             )
             .await;
 

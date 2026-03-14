@@ -1,0 +1,11 @@
+[package]
+name = "async_debug"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+[profile.dev]
+opt-level = 0
+debug = true

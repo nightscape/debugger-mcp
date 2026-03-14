@@ -1,16 +1,107 @@
 use crate::adapters::security;
 use crate::debug::SessionManager;
 use crate::{Error, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Deserialize an optional integer that may arrive as a string.
+/// Some MCP clients (including Claude) stringify integer tool arguments.
+fn deserialize_optional_int_or_string<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<i32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Option<Value> = Option::deserialize(deserializer)?;
+    match v {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom(format!("number out of i32 range: {n}"))),
+        Some(Value::String(s)) => s
+            .parse::<i32>()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom(format!("invalid integer string: {s}"))),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected integer or string, got: {other}"
+        ))),
+    }
+}
+
+/// Deserialize a boolean that may arrive as a string.
+/// Some MCP clients stringify boolean tool arguments.
+fn deserialize_bool_from_anything<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Value = Value::deserialize(deserializer)?;
+    match v {
+        Value::Bool(b) => Ok(b),
+        Value::String(s) => match s.as_str() {
+            "true" | "1" => Ok(true),
+            "false" | "0" | "" => Ok(false),
+            _ => Err(serde::de::Error::custom(format!(
+                "invalid boolean string: {s}"
+            ))),
+        },
+        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
+        Value::Null => Ok(false),
+        other => Err(serde::de::Error::custom(format!(
+            "expected boolean or string, got: {other}"
+        ))),
+    }
+}
+
+/// Deserialize a u64 that may arrive as a string.
+fn deserialize_u64_from_anything<'de, D>(deserializer: D) -> std::result::Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Value = Value::deserialize(deserializer)?;
+    match v {
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| serde::de::Error::custom(format!("number out of u64 range: {n}"))),
+        Value::String(s) => s
+            .parse::<u64>()
+            .map_err(|_| serde::de::Error::custom(format!("invalid u64 string: {s}"))),
+        Value::Null => Ok(0),
+        other => Err(serde::de::Error::custom(format!(
+            "expected number or string, got: {other}"
+        ))),
+    }
+}
+
+/// Deserialize an i32 that may arrive as a string.
+fn deserialize_i32_from_anything<'de, D>(deserializer: D) -> std::result::Result<i32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Value = Value::deserialize(deserializer)?;
+    match v {
+        Value::Number(n) => n
+            .as_i64()
+            .and_then(|n| i32::try_from(n).ok())
+            .ok_or_else(|| serde::de::Error::custom(format!("number out of i32 range: {n}"))),
+        Value::String(s) => s
+            .parse::<i32>()
+            .map_err(|_| serde::de::Error::custom(format!("invalid i32 string: {s}"))),
+        other => Err(serde::de::Error::custom(format!(
+            "expected number or string, got: {other}"
+        ))),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BreakpointSpec {
     pub source_path: String,
+    #[serde(deserialize_with = "deserialize_i32_from_anything")]
     pub line: i32,
     pub condition: Option<String>,
     pub hit_condition: Option<String>,
@@ -25,18 +116,22 @@ pub struct DebuggerStartArgs {
     #[serde(default)]
     pub args: Vec<String>,
     pub cwd: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_bool_from_anything")]
     pub stop_on_entry: bool,
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default)]
     pub breakpoints: Vec<BreakpointSpec>,
+    /// Cargo build profile (e.g. "dev", "release", "debugger"). Rust only.
+    /// When set on a Cargo project, CodeLLDB handles compilation with this profile.
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivateAfterArgs {
     pub source_path: String,
+    #[serde(deserialize_with = "deserialize_i32_from_anything")]
     pub line: i32,
 }
 
@@ -45,6 +140,7 @@ pub struct ActivateAfterArgs {
 pub struct SetBreakpointArgs {
     pub session_id: String,
     pub source_path: String,
+    #[serde(deserialize_with = "deserialize_i32_from_anything")]
     pub line: i32,
     pub condition: Option<String>,
     pub hit_condition: Option<String>,
@@ -56,6 +152,7 @@ pub struct SetBreakpointArgs {
 pub struct RemoveBreakpointArgs {
     pub session_id: String,
     pub source_path: String,
+    #[serde(deserialize_with = "deserialize_i32_from_anything")]
     pub line: i32,
 }
 
@@ -81,6 +178,7 @@ pub struct StackTraceArgs {
 pub struct EvaluateArgs {
     pub session_id: String,
     pub expression: String,
+    #[serde(default, deserialize_with = "deserialize_optional_int_or_string")]
     pub frame_id: Option<i32>,
     pub context: Option<String>,
 }
@@ -101,7 +199,7 @@ pub struct SessionStateArgs {
 #[serde(rename_all = "camelCase")]
 pub struct WaitForStopArgs {
     pub session_id: String,
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_timeout", deserialize_with = "deserialize_u64_from_anything")]
     pub timeout_ms: u64,
 }
 
@@ -133,6 +231,8 @@ pub struct RunToCrashArgs {
     #[serde(default)]
     pub env: HashMap<String, String>,
     pub exception_filter: Option<String>,
+    /// Cargo build profile (e.g. "dev", "release", "debugger"). Rust only.
+    pub profile: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +240,7 @@ pub struct RunToCrashArgs {
 pub struct SnapshotAtArgs {
     pub session_id: String,
     pub source_path: String,
+    #[serde(deserialize_with = "deserialize_i32_from_anything")]
     pub line: i32,
     #[serde(default)]
     pub expressions: Vec<String>,
@@ -152,6 +253,27 @@ pub struct TraceFunctionArgs {
     #[serde(default)]
     pub expressions: Vec<String>,
     pub max_steps: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DebuggingTipsArgs {
+    pub language: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetDataBreakpointArgs {
+    pub session_id: String,
+    /// Variable name or expression to watch
+    pub name: String,
+    /// Variables reference (from a scope/parent variable). Needed for child variables.
+    pub variables_reference: Option<i32>,
+    pub frame_id: Option<i32>,
+    /// Access type: "write" (default), "read", or "readWrite"
+    pub access_type: Option<String>,
+    pub condition: Option<String>,
+    pub hit_condition: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,6 +475,8 @@ impl ToolsHandler {
             "debugger_run_to_crash" => self.debugger_run_to_crash(arguments).await,
             "debugger_snapshot_at" => self.debugger_snapshot_at(arguments).await,
             "debugger_trace_function" => self.debugger_trace_function(arguments).await,
+            "debugger_debugging_tips" => self.debugger_debugging_tips(arguments).await,
+            "debugger_set_data_breakpoint" => self.debugger_set_data_breakpoint(arguments).await,
             _ => Err(Error::MethodNotFound(name.to_string())),
         }
     }
@@ -421,6 +545,7 @@ impl ToolsHandler {
                 validated_cwd,
                 stop_on_entry,
                 args.env,
+                args.profile,
             )
             .await?;
 
@@ -920,7 +1045,7 @@ impl ToolsHandler {
 
         let manager = self.session_manager.read().await;
         let session_id = manager
-            .create_session(&args.language, program, args.args, validated_cwd, true, args.env)
+            .create_session(&args.language, program, args.args, validated_cwd, true, args.env, args.profile)
             .await?;
 
         let session = manager.get_session(&session_id).await?;
@@ -1144,12 +1269,96 @@ impl ToolsHandler {
         }))
     }
 
+    async fn debugger_debugging_tips(&self, arguments: Value) -> Result<Value> {
+        let args: DebuggingTipsArgs = serde_json::from_value(arguments)?;
+        let tips = Self::tips_for_language(&args.language);
+        Ok(json!({ "language": args.language, "tips": tips }))
+    }
+
+    fn tips_for_language(lang: &str) -> &'static str {
+        match lang {
+            "rust" => r#"## Conditional Breakpoints
+
+- LLDB's expression evaluator uses C/C++ semantics, not Rust.
+- Numeric types (usize, i32, etc.) may be treated as strings in conditions — cast with int(): `int(n) > 5` instead of `n > 5`.
+- String comparisons don't work natively — use `context: "repl"` with debugger_evaluate to run LLDB commands like `frame variable` and inspect manually instead.
+- Enum variant matching is unreliable in conditions.
+- Prefer hitCondition (which is numeric) over complex condition expressions.
+
+## Variable Inspection
+
+- Variables may show `<optimized out>` even in debug builds — Rust's MIR optimizer is aggressive.
+- Workaround: ensure opt-level = 0 and debug = 2 in [profile.dev] in Cargo.toml.
+- Use `context: "repl"` with expression `frame variable` to list all locals via LLDB directly (bypasses expression parser).
+- Use `context: "variables"` to read locals via debug info (bypasses expression parser entirely).
+- Complex types (HashMap, BTreeMap, trait objects) need CodeLLDB's Rust formatters — use rust-lldb or CodeLLDB adapter.
+- Closures and captured variables are often opaque to the debugger.
+
+## Async/Await
+
+- Stepping through async functions may land in tokio/executor internals instead of next .await.
+- Breakpoints on .await lines may not hit on older Rust toolchains (fixed in rust-lang/rust#123341) — update to latest stable.
+- Set breakpoints inside async function bodies, not on .await call sites.
+- Stack traces will show Future::poll machinery — look for your function name in the frames.
+- Consider #[tokio::main(flavor = "current_thread")] during debugging to reduce concurrency noise.
+- For async-specific inspection, consider tokio-console as a complement.
+
+## Build Configuration
+
+- Always debug with a debug profile, never cargo install or release.
+- Use a dedicated [profile.debugger] that inherits from dev with opt-level = 0 and debug = 2 — this keeps normal cargo build fast while giving full debug info when needed: `cargo build --profile debugger`.
+- Ensure the debugger profile has opt-level = 0 for your crate; use [profile.debugger.package."*"] with opt-level = 1 if dependency compile times are too slow.
+- The debugger-mcp Rust adapter will compile with cargo build by default — consider configuring it to use --profile debugger for better variable visibility."#,
+            _ => "No known issues. Standard debugging workflows apply.",
+        }
+    }
+
+    async fn debugger_set_data_breakpoint(&self, arguments: Value) -> Result<Value> {
+        let args: SetDataBreakpointArgs = serde_json::from_value(arguments)?;
+
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+
+        // Step 1: Query if this variable supports data breakpoints
+        let info = session
+            .data_breakpoint_info(&args.name, args.variables_reference, args.frame_id)
+            .await?;
+
+        let data_id = info.data_id.ok_or_else(|| {
+            Error::Dap(format!(
+                "Data breakpoint not available for '{}': {}",
+                args.name, info.description
+            ))
+        })?;
+
+        // Step 2: Set the data breakpoint
+        let bp = crate::dap::types::DataBreakpoint {
+            data_id,
+            access_type: Some(args.access_type.unwrap_or_else(|| "write".to_string())),
+            condition: args.condition,
+            hit_condition: args.hit_condition,
+        };
+
+        let results = session.set_data_breakpoints(vec![bp]).await?;
+
+        let result = results.first();
+        let verified = result.map_or(false, |r| r.verified);
+        let message = result.and_then(|r| r.message.clone());
+
+        Ok(json!({
+            "verified": verified,
+            "description": info.description,
+            "accessTypes": info.access_types,
+            "message": message,
+        }))
+    }
+
     pub fn list_tools() -> Vec<Value> {
         vec![
             json!({
                 "name": "debugger_start",
                 "title": "Start Debugging Session",
-                "description": "Starts a new debugging session for a program.\n\nDEBUGGING WORKFLOW — Choose the best approach:\n1. For crash investigation: use debugger_run_to_crash (single call, returns crash context)\n2. For state inspection at a line: use debugger_start + debugger_snapshot_at\n3. For stepping: step_over/into/out now return full context automatically\n\n⭐ RECOMMENDED: Pass breakpoints directly to avoid multiple round-trips:\n  debugger_start({program: \"app.py\", breakpoints: [{sourcePath: \"/abs/path/app.py\", line: 20}]})\n  debugger_wait_for_stop()  // Returns stack trace, variables, source context\n\nAll state-changing tools now return enriched context (stack, variables, source) automatically.\n\nSEE ALSO: debugger_run_to_crash, debugger_snapshot_at, debugger_trace_function",
+                "description": "Starts a new debugging session for a program.\n\nTIP: Call debugger_debugging_tips with the language BEFORE starting a session to learn about known debugger limitations and workarounds.\n\nDEBUGGING WORKFLOW — Choose the best approach:\n1. For crash investigation: use debugger_run_to_crash (single call, returns crash context)\n2. For state inspection at a line: use debugger_start + debugger_snapshot_at\n3. For stepping: step_over/into/out now return full context automatically\n\n⭐ RECOMMENDED: Pass breakpoints directly to avoid multiple round-trips:\n  debugger_start({program: \"app.py\", breakpoints: [{sourcePath: \"/abs/path/app.py\", line: 20}]})\n  debugger_wait_for_stop()  // Returns stack trace, variables, source context\n\nAll state-changing tools now return enriched context (stack, variables, source) automatically.\n\nSEE ALSO: debugger_run_to_crash, debugger_snapshot_at, debugger_trace_function",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1201,6 +1410,10 @@ impl ToolsHandler {
                                 "required": ["sourcePath", "line"]
                             },
                             "description": "Breakpoints to set before the program runs. The program will pause on entry, set all breakpoints, then continue (unless stopOnEntry is also true)."
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Cargo build profile (Rust only). e.g. 'dev', 'release', 'debugger'. When set on a Cargo project, CodeLLDB handles compilation with this profile."
                         }
                     },
                     "required": ["language", "program"]
@@ -1598,6 +1811,10 @@ impl ToolsHandler {
                         "exceptionFilter": {
                             "type": "string",
                             "description": "Exception filter: 'uncaught' (default) or 'raised' (all exceptions including caught)"
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Cargo build profile (Rust only). e.g. 'dev', 'release', 'debugger'."
                         }
                     },
                     "required": ["language", "program"]
@@ -1653,6 +1870,73 @@ impl ToolsHandler {
                         }
                     },
                     "required": ["sessionId"]
+                }
+            }),
+            json!({
+                "name": "debugger_debugging_tips",
+                "title": "Debugging Tips & Known Issues",
+                "description": "Returns language-specific debugging tips, known issues, and workarounds.\nCall this ONCE at the start of a debugging session to learn about limitations and\nbest practices for the language's debug adapter.\nNo session required — works before debugger_start.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "language": {
+                            "type": "string",
+                            "description": "Programming language: 'rust', 'python', 'ruby', 'go', 'javascript'"
+                        }
+                    },
+                    "required": ["language"]
+                },
+                "annotations": {
+                    "returnsTiming": "< 1ms",
+                    "workflow": "preparation",
+                    "category": "documentation",
+                    "priority": 0.3
+                }
+            }),
+            json!({
+                "name": "debugger_set_data_breakpoint",
+                "title": "Set Data Breakpoint (Watchpoint)",
+                "description": "Sets a data breakpoint (watchpoint) that triggers when a variable's memory is written to, read from, or both.\n\nRequires hardware support. Limitations:\n- Max 4 data breakpoints simultaneously (x86_64 hardware limit)\n- Monitored region must be 1, 2, 4, or 8 bytes\n- Not all adapters support this (check adapter capabilities)\n\nThe program must be stopped. The tool first queries if the variable supports data breakpoints, then sets the watchpoint.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Variable name or expression to watch"
+                        },
+                        "variablesReference": {
+                            "type": "integer",
+                            "description": "Variables reference from a scope or parent variable. Needed for child variables."
+                        },
+                        "frameId": {
+                            "type": "integer",
+                            "description": "Stack frame ID for context"
+                        },
+                        "accessType": {
+                            "type": "string",
+                            "enum": ["read", "write", "readWrite"],
+                            "description": "When to trigger: 'write' (default), 'read', or 'readWrite'"
+                        },
+                        "condition": {
+                            "type": "string",
+                            "description": "Optional condition expression"
+                        },
+                        "hitCondition": {
+                            "type": "string",
+                            "description": "Optional hit count condition"
+                        }
+                    },
+                    "required": ["sessionId", "name"]
+                },
+                "annotations": {
+                    "returnsTiming": "< 100ms",
+                    "workflow": "breakpoints",
+                    "category": "breakpoints",
+                    "priority": 0.6
                 }
             }),
         ]
@@ -1738,7 +2022,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = ToolsHandler::list_tools();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 19);
 
         // Verify tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -1758,6 +2042,8 @@ mod tests {
         assert!(tool_names.contains(&"debugger_step_into"));
         assert!(tool_names.contains(&"debugger_step_out"));
         assert!(tool_names.contains(&"debugger_get_output"));
+        assert!(tool_names.contains(&"debugger_debugging_tips"));
+        assert!(tool_names.contains(&"debugger_set_data_breakpoint"));
 
         // Compound tools
         assert!(tool_names.contains(&"debugger_run_to_crash"));
@@ -2105,4 +2391,5 @@ mod tests {
             assert!(!is_rust, "Should identify non-rust language");
         }
     }
+
 }

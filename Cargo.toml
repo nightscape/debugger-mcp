@@ -83,3 +83,16 @@ path = "tests/integration/lang/go_integration_test.rs"
 [[test]]
 name = "rust_integration_test"
 path = "tests/integration/lang/rust_integration_test.rs"
+
+# Model-checked Rust integration tests
+[[test]]
+name = "rust_model_test"
+path = "tests/integration/lang/rust_model_test.rs"
+
+[[test]]
+name = "rust_proptest_test"
+path = "tests/integration/rust_proptest_test.rs"
+
+[[test]]
+name = "rust_init_test"
+path = "tests/integration/lang/rust_init_test.rs"

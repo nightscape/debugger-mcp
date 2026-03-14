@@ -151,7 +151,11 @@ impl ProtocolHandler {
             },
             "serverInfo": {
                 "name": "debugger_mcp",
-                "version": "0.1.0",
+                "version": env!("CARGO_PKG_VERSION"),
+                "build": {
+                    "gitSha": env!("BUILD_GIT_SHA"),
+                    "timestamp": env!("BUILD_TIMESTAMP"),
+                },
             },
         });
 

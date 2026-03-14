@@ -520,9 +520,10 @@ impl DapClient {
             Err(_) => {
                 self.pending_requests.write().await.remove(&seq);
                 warn!(
-                    "⏱️  send_request_with_timeout: '{}' (seq {}) timed out after {:?}, cleaned up pending request",
+                    "⏱️  send_request_with_timeout: '{}' (seq {}) timed out after {:?}, sending DAP cancel and cleaning up",
                     command, seq, timeout
                 );
+                self.send_cancel(seq).await;
                 Err(Error::Dap(format!(
                     "Request '{}' timed out after {:?}",
                     command, timeout
@@ -922,6 +923,27 @@ impl DapClient {
         }
     }
 
+    /// Send a DAP `cancel` request for a timed-out request.
+    /// This tells the adapter to abort the stuck operation (e.g., a hanging LLDB evaluate).
+    /// Fire-and-forget: we don't wait for a response since the adapter may be unresponsive.
+    async fn send_cancel(&self, request_seq: i32) {
+        let cancel_args = serde_json::json!({ "requestId": request_seq });
+        let cancel_seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
+        let cancel_request = Request {
+            seq: cancel_seq,
+            command: "cancel".to_string(),
+            arguments: Some(cancel_args),
+        };
+        if let Err(e) = self.write_tx.send(Message::Request(cancel_request)) {
+            warn!("Failed to send DAP cancel request: {}", e);
+        } else {
+            info!(
+                "🚫 Sent DAP cancel for timed-out request seq {} (cancel seq {})",
+                request_seq, cancel_seq
+            );
+        }
+    }
+
     /// Cancel all pending requests by removing them from the tracking map and
     /// dropping the senders (which causes waiting receivers to get a channel-closed error).
     /// Returns the number of cancelled requests.
@@ -932,11 +954,16 @@ impl DapClient {
         let mut pending = self.pending_requests.write().await;
         let count = pending.len();
         if count > 0 {
+            let seqs: Vec<i32> = pending.keys().copied().collect();
             warn!(
-                "🧹 cancel_pending_requests: Dropping {} orphaned pending request(s)",
-                count
+                "🧹 cancel_pending_requests: Dropping {} orphaned pending request(s): {:?}",
+                count, seqs
             );
             pending.clear();
+            drop(pending);
+            for seq in seqs {
+                self.send_cancel(seq).await;
+            }
         }
         count
     }
@@ -1471,6 +1498,78 @@ impl DapClient {
         }
 
         Ok(())
+    }
+
+    /// Query data breakpoint info for a variable. Returns the opaque dataId
+    /// needed by setDataBreakpoints, plus the supported access types.
+    pub async fn data_breakpoint_info(
+        &self,
+        name: &str,
+        variables_reference: Option<i32>,
+        frame_id: Option<i32>,
+    ) -> Result<DataBreakpointInfoBody> {
+        let args = DataBreakpointInfoArguments {
+            name: name.to_string(),
+            variables_reference,
+            frame_id,
+        };
+
+        let timeout = std::time::Duration::from_secs(10);
+        let response = self
+            .send_request_with_timeout(
+                "dataBreakpointInfo",
+                Some(serde_json::to_value(args)?),
+                timeout,
+            )
+            .await?;
+
+        if !response.success {
+            return Err(Error::Dap(format!(
+                "dataBreakpointInfo failed: {:?}",
+                response.message
+            )));
+        }
+
+        let body: DataBreakpointInfoBody = serde_json::from_value(
+            response
+                .body
+                .ok_or_else(|| Error::Dap("No body in dataBreakpointInfo response".to_string()))?,
+        )
+        .map_err(|e| Error::Dap(format!("Failed to parse dataBreakpointInfo response: {}", e)))?;
+
+        Ok(body)
+    }
+
+    /// Set data breakpoints (watchpoints). Replaces all current data breakpoints.
+    pub async fn set_data_breakpoints(
+        &self,
+        breakpoints: Vec<DataBreakpoint>,
+    ) -> Result<Vec<Breakpoint>> {
+        let args = SetDataBreakpointsArguments { breakpoints };
+
+        let timeout = std::time::Duration::from_secs(10);
+        let response = self
+            .send_request_with_timeout(
+                "setDataBreakpoints",
+                Some(serde_json::to_value(args)?),
+                timeout,
+            )
+            .await?;
+
+        if !response.success {
+            return Err(Error::Dap(format!(
+                "setDataBreakpoints failed: {:?}",
+                response.message
+            )));
+        }
+
+        let body = response
+            .body
+            .ok_or_else(|| Error::Dap("No body in setDataBreakpoints response".to_string()))?;
+        let breakpoints: Vec<Breakpoint> =
+            serde_json::from_value(body["breakpoints"].clone()).unwrap_or_default();
+
+        Ok(breakpoints)
     }
 
     pub async fn evaluate(

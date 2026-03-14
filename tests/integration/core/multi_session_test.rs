@@ -415,6 +415,7 @@ async fn test_nodejs_multi_session_full_workflow() {
             Some("tests/fixtures".to_string()),
             true, // stopOnEntry
             std::collections::HashMap::new(),
+            None,
         )
         .await
         .expect("Failed to create Node.js session");
@@ -544,6 +545,7 @@ async fn test_child_session_spawning() {
             None,
             false,
             std::collections::HashMap::new(),
+            None,
         )
         .await
         .expect("Failed to create session");

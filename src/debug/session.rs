@@ -754,16 +754,17 @@ impl DebugSession {
         // (after 'initialized' event, before configurationDone - the correct DAP sequence)
         // This fixes the Go debugging issue where breakpoints were being applied too late
 
-        // DON'T manually set state to Running here!
-        // The DAP event handlers will update the state based on actual events:
-        // - 'stopped' event (if stopOnEntry=true) → Stopped state
-        // - 'continued' event → Running state
-        // - 'terminated'/'exited' events → Terminated state
-        //
-        // Setting Running here causes a race condition where we overwrite
-        // the Stopped state from the 'stopped' event handler.
-        //
-        // See: https://github.com/ruvnet/debugger_mcp/issues/stopOnEntry-race-condition
+        // Give DAP events a moment to arrive (stopped, continued, terminated).
+        // If after 500ms the state is still Initializing, no event came — set Running
+        // as a fallback so the session doesn't get stuck forever.
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        {
+            let mut state = self.state.write().await;
+            if matches!(state.state, DebugState::Initializing) {
+                info!("⚠️  No DAP event received after launch — setting state to Running as fallback");
+                state.set_state(DebugState::Running);
+            }
+        }
 
         Ok(())
     }
@@ -914,34 +915,49 @@ impl DebugSession {
                     state.add_breakpoint(source_path.clone(), line, condition.clone(), hit_condition.clone());
                 }
 
-                // Set via DAP immediately
+                // DAP setBreakpoints replaces ALL breakpoints for a source,
+                // so we must send every breakpoint for this file, not just the new one.
                 let source = Source {
                     name: None,
                     path: Some(source_path.clone()),
                     source_reference: None,
                 };
 
-                let breakpoints = vec![SourceBreakpoint {
-                    line,
-                    column: None,
-                    condition,
-                    hit_condition,
-                }];
+                let breakpoints = {
+                    let state = self.state.read().await;
+                    state
+                        .breakpoints
+                        .get(&source_path)
+                        .map(|bps| {
+                            bps.iter()
+                                .map(|bp| SourceBreakpoint {
+                                    line: bp.line,
+                                    column: None,
+                                    condition: bp.condition.clone(),
+                                    hit_condition: bp.hit_condition.clone(),
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                };
 
                 let client_arc = self.get_debug_client().await;
                 let client = client_arc.read().await;
                 let result = client.set_breakpoints(source, breakpoints).await?;
 
-                // Update state with results
-                if let Some(bp) = result.first() {
-                    let mut state = self.state.write().await;
+                // Update state with all results (response is 1:1 with sent breakpoints)
+                let mut state = self.state.write().await;
+                let mut new_bp_verified = false;
+                for bp in &result {
                     if let Some(id) = bp.id {
-                        state.update_breakpoint(&source_path, line, id, bp.verified);
+                        let bp_line = bp.line.unwrap_or(0);
+                        state.update_breakpoint(&source_path, bp_line, id, bp.verified);
+                        if bp_line == line {
+                            new_bp_verified = bp.verified;
+                        }
                     }
-                    Ok(bp.verified)
-                } else {
-                    Ok(false)
                 }
+                Ok(new_bp_verified)
             }
             DebugState::Terminated | DebugState::Failed { .. } => Err(crate::Error::InvalidState(
                 format!("Cannot set breakpoint in state: {:?}", current_state),
@@ -1156,7 +1172,12 @@ impl DebugSession {
         client.cancel_pending_requests().await;
         client.next(thread_id).await?;
 
-        // State will be updated by 'stopped' event handler when step completes
+        // Mark Running so wait_for_stop_enriched doesn't return the stale
+        // Stopped state.  The event handler will set Stopped when the step
+        // completes.
+        let mut state = self.state.write().await;
+        state.set_state(DebugState::Running);
+
         Ok(())
     }
 
@@ -1166,7 +1187,9 @@ impl DebugSession {
         client.cancel_pending_requests().await;
         client.step_in(thread_id).await?;
 
-        // State will be updated by 'stopped' event handler when step completes
+        let mut state = self.state.write().await;
+        state.set_state(DebugState::Running);
+
         Ok(())
     }
 
@@ -1176,7 +1199,8 @@ impl DebugSession {
         client.cancel_pending_requests().await;
         client.step_out(thread_id).await?;
 
-        // State will be updated by 'stopped' event handler when step completes
+        let mut state = self.state.write().await;
+        state.set_state(DebugState::Running);
         Ok(())
     }
 
@@ -1205,6 +1229,26 @@ impl DebugSession {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
         client.set_exception_breakpoints(filters).await
+    }
+
+    pub async fn data_breakpoint_info(
+        &self,
+        name: &str,
+        variables_reference: Option<i32>,
+        frame_id: Option<i32>,
+    ) -> Result<crate::dap::types::DataBreakpointInfoBody> {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        client.data_breakpoint_info(name, variables_reference, frame_id).await
+    }
+
+    pub async fn set_data_breakpoints(
+        &self,
+        breakpoints: Vec<crate::dap::types::DataBreakpoint>,
+    ) -> Result<Vec<crate::dap::types::Breakpoint>> {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        client.set_data_breakpoints(breakpoints).await
     }
 
     pub async fn get_local_variables(&self, frame_id: i32, expand_depth: u32) -> Result<Vec<crate::dap::types::Variable>> {

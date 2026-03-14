@@ -718,6 +718,11 @@ impl RustAdapter {
             // LLDB formatters (lldb_lookup.py / lldb_providers.py) for HashMap, Vec,
             // BTreeMap, String, etc. without manual initCommands.
             "sourceLanguages": ["rust"],
+            // Use CodeLLDB's "simple" expression evaluator instead of LLDB's native one.
+            // The native evaluator uses C/C++ semantics, ignores data formatters, and hangs
+            // on complex Rust types (HashMap, Vec, etc.). The simple evaluator works on
+            // formatted views and supports indexing, comparisons, and member access correctly.
+            "expressions": "simple",
             // Also load formatters explicitly via initCommands as a fallback
             // (e.g. if sourceLanguages isn't supported by the adapter version).
             "initCommands": Self::rust_lldb_init_commands(),
@@ -732,10 +737,63 @@ impl RustAdapter {
         if let Some(cwd_path) = cwd {
             launch["cwd"] = json!(cwd_path);
         } else {
-            // Default to /workspace (common in Docker/CI environments)
-            // This matches the compilation directory embedded in DWARF debug info
-            launch["cwd"] = json!("/workspace");
+            // Default to the binary's parent directory so CodeLLDB can find source files
+            // via DWARF debug info. The old /workspace default only works in Docker/CI.
+            let default_cwd = std::path::Path::new(binary_path)
+                .parent()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|| ".".to_string());
+            launch["cwd"] = json!(default_cwd);
         }
+
+        if !env.is_empty() {
+            launch["env"] = json!(env);
+        }
+
+        launch
+    }
+
+    /// Generate launch configuration using CodeLLDB's built-in Cargo integration.
+    ///
+    /// Instead of compiling ourselves and passing `"program"`, this passes `"cargo"`
+    /// in the launch config so CodeLLDB handles compilation and binary path resolution.
+    ///
+    /// # Arguments
+    ///
+    /// * `cargo_root` - Cargo project root (directory containing Cargo.toml)
+    /// * `args` - Arguments to pass to the binary
+    /// * `stop_on_entry` - Whether to stop at program entry point
+    /// * `env` - Environment variables for the program
+    /// * `profile` - Cargo build profile (e.g. "dev", "release", "debugger")
+    pub fn cargo_launch_args(
+        cargo_root: &str,
+        args: &[String],
+        stop_on_entry: bool,
+        env: &std::collections::HashMap<String, String>,
+        profile: Option<&str>,
+    ) -> Value {
+        let mut cargo_args = vec!["build".to_string()];
+        if let Some(profile) = profile {
+            cargo_args.push("--profile".to_string());
+            cargo_args.push(profile.to_string());
+        }
+
+        let mut launch = json!({
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": cargo_args,
+                "cwd": cargo_root,
+            },
+            "args": args,
+            "cwd": cargo_root,
+            "stopOnEntry": stop_on_entry,
+            "terminal": "console",
+            "stdio": [null, null, null],
+            "sourceLanguages": ["rust"],
+            "expressions": "simple",
+            "initCommands": Self::rust_lldb_init_commands(),
+        });
 
         if !env.is_empty() {
             launch["env"] = json!(env);
@@ -901,8 +959,8 @@ mod tests {
         assert_eq!(config["program"], binary);
         assert_eq!(config["args"], json!([]));
         assert_eq!(config["stopOnEntry"], false);
-        // When cwd is None, defaults to /workspace for DWARF path resolution
-        assert_eq!(config["cwd"], "/workspace");
+        // When cwd is None, defaults to the binary's parent directory
+        assert_eq!(config["cwd"], "/workspace/target/debug");
     }
 
     #[test]
@@ -985,6 +1043,53 @@ mod tests {
         let config = RustAdapter::launch_args(binary, &args, None, false, &env);
 
         assert_eq!(config["env"]["RUST_LOG"], "trace");
+    }
+
+    #[test]
+    fn test_cargo_launch_args_basic() {
+        let config = RustAdapter::cargo_launch_args(
+            "/workspace/my-project",
+            &[],
+            false,
+            &std::collections::HashMap::new(),
+            None,
+        );
+
+        assert_eq!(config["type"], "lldb");
+        assert_eq!(config["request"], "launch");
+        assert!(config["program"].is_null(), "cargo launch should not have 'program'");
+        assert_eq!(config["cargo"]["args"], json!(["build"]));
+        assert_eq!(config["cargo"]["cwd"], "/workspace/my-project");
+        assert_eq!(config["cwd"], "/workspace/my-project");
+        assert_eq!(config["expressions"], "simple");
+        assert_eq!(config["sourceLanguages"], json!(["rust"]));
+    }
+
+    #[test]
+    fn test_cargo_launch_args_with_profile() {
+        let config = RustAdapter::cargo_launch_args(
+            "/workspace/my-project",
+            &["--verbose".to_string()],
+            true,
+            &std::collections::HashMap::new(),
+            Some("debugger"),
+        );
+
+        assert_eq!(config["cargo"]["args"], json!(["build", "--profile", "debugger"]));
+        assert_eq!(config["args"], json!(["--verbose"]));
+        assert_eq!(config["stopOnEntry"], true);
+    }
+
+    #[test]
+    fn test_launch_args_has_simple_expressions() {
+        let config = RustAdapter::launch_args(
+            "/workspace/target/debug/app",
+            &[],
+            None,
+            false,
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(config["expressions"], "simple");
     }
 
     // Compilation tests require rustc installed
