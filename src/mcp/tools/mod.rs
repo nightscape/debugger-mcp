@@ -125,6 +125,11 @@ pub struct DebuggerStartArgs {
     /// Cargo build profile (e.g. "dev", "release", "debugger"). Rust only.
     /// When set on a Cargo project, CodeLLDB handles compilation with this profile.
     pub profile: Option<String>,
+    /// RSS memory limit in MB for the debug adapter supervisor.
+    /// If the adapter exceeds this, it is killed and the session fails with
+    /// recovery recommendations. Default: 1024MB.
+    #[serde(default, deserialize_with = "deserialize_optional_int_or_string")]
+    pub supervisor_memory_limit_mb: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +283,20 @@ pub struct SetDataBreakpointArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GetVariablesArgs {
+    pub session_id: String,
+    #[serde(default, deserialize_with = "deserialize_optional_int_or_string")]
+    pub variables_reference: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_int_or_string")]
+    pub frame_id: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_optional_int_or_string")]
+    pub max_count: Option<i32>,
+    pub scope: Option<String>,
+    pub filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct GetOutputArgs {
     pub session_id: String,
     pub category: Option<String>,
@@ -286,6 +305,13 @@ pub struct GetOutputArgs {
     pub since_line: Option<usize>,
 }
 
+fn is_bare_identifier(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Poll session state until stopped, terminated, or timeout.
+/// On stop, enriches the response with stack trace, source context, and local variable names.
 async fn wait_for_stop_enriched(
     session: &crate::debug::session::DebugSession,
     timeout_ms: u64,
@@ -326,8 +352,8 @@ async fn wait_for_stop_enriched(
 
         if start.elapsed() > timeout {
             return Err(crate::Error::InvalidState(format!(
-                "Timeout waiting for program to stop ({}ms)",
-                timeout_ms
+                "Timeout waiting for program to stop ({}ms). Current state: {:?}",
+                timeout_ms, state
             )));
         }
 
@@ -335,16 +361,79 @@ async fn wait_for_stop_enriched(
     }
 }
 
+/// Validate session is stopped and return the thread_id (with optional override).
+fn require_stopped(
+    state: &crate::debug::state::DebugState,
+    thread_id_override: Option<i32>,
+) -> crate::Result<i32> {
+    if let crate::debug::state::DebugState::Stopped { thread_id, .. } = state {
+        Ok(thread_id_override.unwrap_or(*thread_id))
+    } else {
+        Err(crate::Error::InvalidState(
+            "Cannot step while program is running. The program must be stopped first."
+                .to_string(),
+        ))
+    }
+}
+
+/// Convert a slice of Variables into a JSON array of {name, value, type}.
+fn format_variables_json(vars: &[crate::dap::types::Variable]) -> Vec<Value> {
+    vars.iter()
+        .map(|v| {
+            json!({
+                "name": v.name,
+                "value": v.value,
+                "type": v.type_
+            })
+        })
+        .collect()
+}
+
+/// Fetch source context around a stack frame's current line.
+async fn fetch_source_context(frame: &crate::dap::types::StackFrame) -> Option<String> {
+    let path = frame.source.as_ref()?.path.as_ref()?;
+    let src_timeout = tokio::time::Duration::from_secs(1);
+    tokio::time::timeout(src_timeout, read_source_context(path, frame.line, 5))
+        .await
+        .ok()?
+}
+
+/// Fetch local variables for a frame with timeout, returning a JSON array.
+/// Returns None on timeout or error (never breaks the session).
+async fn fetch_frame_variables(
+    session: &crate::debug::session::DebugSession,
+    frame_id: i32,
+    expand_depth: u32,
+) -> Option<Vec<Value>> {
+    let vars_timeout = tokio::time::Duration::from_secs(5);
+    match tokio::time::timeout(vars_timeout, session.get_local_variables(frame_id, expand_depth)).await {
+        Ok(Ok(vars)) => Some(format_variables_json(&vars)),
+        Err(_) => {
+            session.cancel_pending_requests().await;
+            None
+        }
+        Ok(Err(_)) => None,
+    }
+}
+
 async fn build_stop_context(
     session: &crate::debug::session::DebugSession,
     stack_limit: Option<i32>,
 ) -> Value {
+    *session.last_tool_context.write().await =
+        Some("build_stop_context variables".to_string());
+
     let stack_limit = stack_limit.unwrap_or(3);
     let mut ctx = json!({});
 
     // Stack trace with timeout
     let stack_timeout = tokio::time::Duration::from_secs(3);
-    if let Ok(Ok(frames)) = tokio::time::timeout(stack_timeout, session.stack_trace(Some(stack_limit))).await {
+    let stack_result = tokio::time::timeout(stack_timeout, session.stack_trace(Some(stack_limit))).await;
+    if stack_result.is_err() {
+        // Stack trace timed out — cancel pending requests so subsequent ops work
+        session.cancel_pending_requests().await;
+    }
+    if let Ok(Ok(frames)) = stack_result {
         ctx["stackTrace"] = json!(format_stack_frames(&frames, &session.program));
 
         if let Some(top) = frames.first() {
@@ -355,26 +444,12 @@ async fn build_stop_context(
                 "source": top.source
             });
 
-            // Source context with timeout
-            if let Some(src) = &top.source {
-                if let Some(path) = &src.path {
-                    let src_timeout = tokio::time::Duration::from_secs(1);
-                    if let Ok(Some(source_ctx)) = tokio::time::timeout(src_timeout, read_source_context(path, top.line, 5)).await {
-                        ctx["sourceContext"] = json!(source_ctx);
-                    }
-                }
+            if let Some(source_ctx) = fetch_source_context(top).await {
+                ctx["sourceContext"] = json!(source_ctx);
             }
 
-            // Local variables with timeout
-            let vars_timeout = tokio::time::Duration::from_secs(5);
-            if let Ok(Ok(vars)) = tokio::time::timeout(vars_timeout, session.get_local_variables(top.id, 1)).await {
-                let var_list: Vec<Value> = vars.iter().map(|v| {
-                    json!({
-                        "name": v.name,
-                        "value": v.value,
-                        "type": v.type_
-                    })
-                }).collect();
+            // depth=0: names/types only, no child expansion (prevents memory explosion)
+            if let Some(var_list) = fetch_frame_variables(session, top.id, 0).await {
                 ctx["localVariables"] = json!(var_list);
             }
         }
@@ -477,6 +552,7 @@ impl ToolsHandler {
             "debugger_trace_function" => self.debugger_trace_function(arguments).await,
             "debugger_debugging_tips" => self.debugger_debugging_tips(arguments).await,
             "debugger_set_data_breakpoint" => self.debugger_set_data_breakpoint(arguments).await,
+            "debugger_get_variables" => self.debugger_get_variables(arguments).await,
             _ => Err(Error::MethodNotFound(name.to_string())),
         }
     }
@@ -535,6 +611,12 @@ impl ToolsHandler {
 
         let has_breakpoints = !args.breakpoints.is_empty();
         let stop_on_entry = args.stop_on_entry || has_breakpoints;
+
+        // Apply per-session supervisor memory limit if specified
+        if let Some(limit) = args.supervisor_memory_limit_mb {
+            let mut manager = self.session_manager.write().await;
+            manager.set_supervisor_rss_limit(limit as u64);
+        }
 
         let manager = self.session_manager.read().await;
         let session_id = manager
@@ -779,17 +861,11 @@ impl ToolsHandler {
 
             if include_vars {
                 if let Some(top) = frames.first() {
-                    let vars_timeout = tokio::time::Duration::from_secs(5);
-                    if let Ok(Ok(vars)) = tokio::time::timeout(vars_timeout, session.get_local_variables(top.id, 1)).await {
-                        let var_list: Vec<Value> = vars.iter().map(|v| json!({"name": v.name, "value": v.value, "type": v.type_})).collect();
+                    if let Some(var_list) = fetch_frame_variables(&session, top.id, 1).await {
                         result["localVariables"] = json!(var_list);
                     }
-                    if let Some(src) = &top.source {
-                        if let Some(path) = &src.path {
-                            if let Ok(Some(src_ctx)) = tokio::time::timeout(tokio::time::Duration::from_secs(1), read_source_context(path, top.line, 5)).await {
-                                result["sourceContext"] = json!(src_ctx);
-                            }
-                        }
+                    if let Some(src_ctx) = fetch_source_context(top).await {
+                        result["sourceContext"] = json!(src_ctx);
                     }
                 }
             }
@@ -800,23 +876,17 @@ impl ToolsHandler {
 
             if include_vars {
                 for frame in &frames {
-                    let vars_timeout = tokio::time::Duration::from_secs(5);
-                    if let Ok(Ok(vars)) = tokio::time::timeout(vars_timeout, session.get_local_variables(frame.id, 1)).await {
-                        let var_list: Vec<Value> = vars.iter().map(|v| json!({"name": v.name, "value": v.value, "type": v.type_})).collect();
-                        if let Some(frame_obj) = result["stackFrames"].as_array_mut() {
-                            if let Some(f) = frame_obj.iter_mut().find(|f| f["id"] == frame.id) {
+                    if let Some(var_list) = fetch_frame_variables(&session, frame.id, 1).await {
+                        if let Some(arr) = result["stackFrames"].as_array_mut() {
+                            if let Some(f) = arr.iter_mut().find(|f| f["id"] == frame.id) {
                                 f["localVariables"] = json!(var_list);
                             }
                         }
                     }
-                    if let Some(src) = &frame.source {
-                        if let Some(path) = &src.path {
-                            if let Ok(Some(src_ctx)) = tokio::time::timeout(tokio::time::Duration::from_secs(1), read_source_context(path, frame.line, 5)).await {
-                                if let Some(frame_obj) = result["stackFrames"].as_array_mut() {
-                                    if let Some(f) = frame_obj.iter_mut().find(|f| f["id"] == frame.id) {
-                                        f["sourceContext"] = json!(src_ctx);
-                                    }
-                                }
+                    if let Some(src_ctx) = fetch_source_context(frame).await {
+                        if let Some(arr) = result["stackFrames"].as_array_mut() {
+                            if let Some(f) = arr.iter_mut().find(|f| f["id"] == frame.id) {
+                                f["sourceContext"] = json!(src_ctx);
                             }
                         }
                     }
@@ -833,6 +903,10 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
+        // Record context for supervisor diagnostics
+        *session.last_tool_context.write().await =
+            Some(format!("debugger_evaluate expression=\"{}\"", args.expression));
+
         // Validate we're in a stopped state
         let state = session.get_state().await;
         if !matches!(state, crate::debug::state::DebugState::Stopped { .. }) {
@@ -841,13 +915,36 @@ impl ToolsHandler {
             ));
         }
 
+        let context_str = args.context.as_deref().unwrap_or("watch");
+        let warn_bare_id = context_str != "repl"
+            && context_str != "variables"
+            && is_bare_identifier(&args.expression);
+
         let result = session
             .evaluate(&args.expression, args.frame_id, args.context)
-            .await?;
+            .await;
 
-        Ok(json!({
-            "result": result
-        }))
+        match result {
+            Ok(value) => {
+                let mut resp = json!({ "result": value });
+                if warn_bare_id {
+                    resp["warning"] = json!(
+                        "Consider using debugger_get_variables instead of evaluating bare variable names. \
+                         debugger_evaluate triggers the expression compiler which can cause high memory usage \
+                         for containers (Vec, HashMap). debugger_get_variables reads directly from debug info \
+                         and is safe for any size."
+                    );
+                }
+                Ok(resp)
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("timed out") {
+                    session.cancel_pending_requests().await;
+                }
+                Err(e)
+            }
+        }
     }
 
     async fn debugger_wait_for_stop(&self, arguments: Value) -> Result<Value> {
@@ -856,55 +953,7 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
-        let timeout = tokio::time::Duration::from_millis(args.timeout_ms);
-        let start = tokio::time::Instant::now();
-
-        loop {
-            let state = session.get_state().await;
-
-            // Check if we're stopped
-            if let crate::debug::state::DebugState::Stopped { thread_id, reason } = state {
-                let mut result = json!({
-                    "state": "Stopped",
-                    "threadId": thread_id,
-                    "reason": reason
-                });
-
-                let ctx = build_stop_context(&session, Some(3)).await;
-                // Merge context fields into result
-                if let Value::Object(map) = ctx {
-                    for (k, v) in map {
-                        result[k] = v;
-                    }
-                }
-
-                return Ok(result);
-            }
-
-            // Check if program terminated
-            if matches!(state, crate::debug::state::DebugState::Terminated) {
-                return Ok(json!({
-                    "state": "Terminated",
-                    "reason": "Program exited"
-                }));
-            }
-
-            // Check if program failed
-            if let crate::debug::state::DebugState::Failed { error } = state {
-                return Err(Error::Dap(format!("Session failed: {}", error)));
-            }
-
-            // Check timeout
-            if start.elapsed() > timeout {
-                return Err(Error::InvalidState(format!(
-                    "Timeout waiting for program to stop ({}ms). Current state: {:?}",
-                    args.timeout_ms, state
-                )));
-            }
-
-            // Sleep briefly before checking again
-            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-        }
+        wait_for_stop_enriched(&session, args.timeout_ms).await
     }
 
     async fn debugger_list_breakpoints(&self, arguments: Value) -> Result<Value> {
@@ -958,23 +1007,11 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
-        // Validate we're in a stopped state
         let state = session.get_state().await;
-        let thread_id = if let crate::debug::state::DebugState::Stopped { thread_id, .. } = state {
-            thread_id
-        } else {
-            return Err(Error::InvalidState(
-                "Cannot step while program is running. The program must be stopped first."
-                    .to_string(),
-            ));
-        };
-
-        let thread_id = args.thread_id.unwrap_or(thread_id);
+        let thread_id = require_stopped(&state, args.thread_id)?;
         session.step_over(thread_id).await?;
 
-        // Auto-wait for stop and return enriched context
-        let result = wait_for_stop_enriched(&session, 30_000).await?;
-        Ok(result)
+        wait_for_stop_enriched(&session, 30_000).await
     }
 
     async fn debugger_step_into(&self, arguments: Value) -> Result<Value> {
@@ -983,22 +1020,11 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
-        // Validate we're in a stopped state
         let state = session.get_state().await;
-        let thread_id = if let crate::debug::state::DebugState::Stopped { thread_id, .. } = state {
-            thread_id
-        } else {
-            return Err(Error::InvalidState(
-                "Cannot step while program is running. The program must be stopped first."
-                    .to_string(),
-            ));
-        };
-
-        let thread_id = args.thread_id.unwrap_or(thread_id);
+        let thread_id = require_stopped(&state, args.thread_id)?;
         session.step_into(thread_id).await?;
 
-        let result = wait_for_stop_enriched(&session, 30_000).await?;
-        Ok(result)
+        wait_for_stop_enriched(&session, 30_000).await
     }
 
     async fn debugger_step_out(&self, arguments: Value) -> Result<Value> {
@@ -1007,22 +1033,11 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
-        // Validate we're in a stopped state
         let state = session.get_state().await;
-        let thread_id = if let crate::debug::state::DebugState::Stopped { thread_id, .. } = state {
-            thread_id
-        } else {
-            return Err(Error::InvalidState(
-                "Cannot step while program is running. The program must be stopped first."
-                    .to_string(),
-            ));
-        };
-
-        let thread_id = args.thread_id.unwrap_or(thread_id);
+        let thread_id = require_stopped(&state, args.thread_id)?;
         session.step_out(thread_id).await?;
 
-        let result = wait_for_stop_enriched(&session, 30_000).await?;
-        Ok(result)
+        wait_for_stop_enriched(&session, 30_000).await
     }
 
     async fn debugger_run_to_crash(&self, arguments: Value) -> Result<Value> {
@@ -1287,10 +1302,14 @@ impl ToolsHandler {
 
 ## Variable Inspection
 
+- ALWAYS use debugger_get_variables to read variable values. NEVER use debugger_evaluate for bare variable names.
+- debugger_evaluate triggers LLDB's JIT compiler which can consume GBs of memory for containers (Vec, HashMap).
+- debugger_get_variables reads directly from DWARF debug info and is safe for any container size.
+- Workflow: debugger_get_variables({sessionId}) to see locals → debugger_get_variables({sessionId, variablesReference: N}) to drill into a specific variable.
+- Use debugger_evaluate ONLY for expressions: arithmetic, comparisons, function calls.
 - Variables may show `<optimized out>` even in debug builds — Rust's MIR optimizer is aggressive.
 - Workaround: ensure opt-level = 0 and debug = 2 in [profile.dev] in Cargo.toml.
 - Use `context: "repl"` with expression `frame variable` to list all locals via LLDB directly (bypasses expression parser).
-- Use `context: "variables"` to read locals via debug info (bypasses expression parser entirely).
 - Complex types (HashMap, BTreeMap, trait objects) need CodeLLDB's Rust formatters — use rust-lldb or CodeLLDB adapter.
 - Closures and captured variables are often opaque to the debugger.
 
@@ -1351,6 +1370,75 @@ impl ToolsHandler {
             "accessTypes": info.access_types,
             "message": message,
         }))
+    }
+
+    async fn debugger_get_variables(&self, arguments: Value) -> Result<Value> {
+        let args: GetVariablesArgs = serde_json::from_value(arguments)?;
+
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+
+        *session.last_tool_context.write().await =
+            Some(format!("debugger_get_variables variablesReference={:?} frameId={:?}", args.variables_reference, args.frame_id));
+
+        let state = session.get_state().await;
+        if !matches!(state, crate::debug::state::DebugState::Stopped { .. }) {
+            return Err(Error::InvalidState(
+                "Cannot get variables while program is running. Use debugger_wait_for_stop() first.".to_string()
+            ));
+        }
+
+        let max_count = args.max_count.unwrap_or(50).min(200);
+        let filter = args.filter.as_deref();
+
+        let variables = if let Some(var_ref) = args.variables_reference {
+            session.get_variable_children(var_ref, filter, max_count).await
+        } else {
+            // Resolve frame_id: use provided, or auto-fetch from stopped thread
+            let frame_id = if let Some(fid) = args.frame_id {
+                fid
+            } else {
+                let frames = session.stack_trace(Some(1)).await?;
+                if frames.is_empty() {
+                    return Err(Error::Dap("No stack frames available".to_string()));
+                }
+                frames[0].id
+            };
+            session.get_scope_variables(frame_id, args.scope.as_deref(), max_count).await
+        };
+
+        match variables {
+            Ok(vars) => {
+                let truncated = vars.len() == max_count as usize;
+                let has_expandable = vars.iter().any(|v| v.variables_reference > 0);
+                let json_vars: Vec<Value> = vars.iter().map(|v| {
+                    json!({
+                        "name": v.name,
+                        "value": v.value,
+                        "type": v.type_,
+                        "variablesReference": v.variables_reference,
+                        "expandable": v.variables_reference > 0,
+                    })
+                }).collect();
+
+                let mut result = json!({
+                    "variables": json_vars,
+                    "count": json_vars.len(),
+                    "truncated": truncated,
+                });
+                if has_expandable {
+                    result["hint"] = json!("Use variablesReference with this tool to drill into expandable variables");
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("timed out") || err_str.contains("Timeout") {
+                    session.cancel_pending_requests().await;
+                }
+                Err(e)
+            }
+        }
     }
 
     pub fn list_tools() -> Vec<Value> {
@@ -1540,7 +1628,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_stack_trace",
                 "title": "Get Stack Trace",
-                "description": "Retrieves the current call stack when execution is paused. Shows the sequence of function calls that led to the current execution point.\n\n⭐ PRIMARY PURPOSE: Get Frame IDs for debugger_evaluate\n======================================================\nThe 'id' field in each frame is CRITICAL - use it with debugger_evaluate to access variables:\n\nRETURNS: Array of stack frames, each containing:\n- id: Frame identifier → USE THIS as frameId in debugger_evaluate ⭐\n- name: Function/method name\n- source: {path: \"file path\", name: \"filename\"}\n- line: Current line number in this frame\n- column: Column number (if available)\n\n⚠️ Frame IDs Change Between Stops!\n================================\nFrame IDs are NOT stable across different stop events:\n- After EACH stop (breakpoint, step, continue), frame IDs change\n- ALWAYS call debugger_stack_trace fresh after each stop\n- NEVER reuse frame IDs from previous stops\n\nEXAMPLE PATTERN:\n  // Stop 1: Hit breakpoint\n  debugger_wait_for_stop()\n  stack1 = debugger_stack_trace()\n  frameId1 = stack1.stackFrames[0].id  // e.g., id = 5\n  debugger_evaluate({expression: \"x\", frameId: frameId1})  ✓\n  \n  // Stop 2: After continue and hit another breakpoint\n  debugger_continue()\n  debugger_wait_for_stop()\n  stack2 = debugger_stack_trace()  // GET FRESH TRACE!\n  frameId2 = stack2.stackFrames[0].id  // e.g., id = 8 (DIFFERENT!)\n  \n  // Using old frameId1 here would FAIL ❌\n  debugger_evaluate({expression: \"x\", frameId: frameId2})  ✓ Correct\n\nWORKFLOW:\n1. Session must be in 'Stopped' state (e.g., at a breakpoint)\n2. Call this tool to get current stack frames\n3. Extract the 'id' field from desired frame\n4. Pass that 'id' as frameId to debugger_evaluate\n5. Repeat steps 2-4 after each new stop event\n\nTIMING: Returns in 10-50ms depending on stack depth\n\nTIP: The first frame (index 0) is the current execution point. Higher indices are caller frames.\n\nCOMMON USE CASES:\n- Get frame IDs for debugger_evaluate (primary use)\n- Inspect where a breakpoint was hit\n- Understand call hierarchy\n- Diagnose unexpected execution paths\n\nSEE ALSO: debugger_evaluate (requires frame IDs from this tool), debugger://patterns (frame ID usage examples)",
+                "description": "Retrieves the current call stack when execution is paused. Shows the sequence of function calls that led to the current execution point.\n\n⭐ PRIMARY PURPOSE: Get Frame IDs for debugger_get_variables and debugger_evaluate\n======================================================\nThe 'id' field in each frame is used with debugger_get_variables (preferred) or debugger_evaluate (expressions only).\n\nTIP: debugger_get_variables can auto-resolve the frame ID, so you often don't need this tool just to inspect variables.\n\nRETURNS: Array of stack frames, each containing:\n- id: Frame identifier → USE THIS as frameId in debugger_get_variables or debugger_evaluate\n- name: Function/method name\n- source: {path: \"file path\", name: \"filename\"}\n- line: Current line number in this frame\n- column: Column number (if available)\n\n⚠️ Frame IDs Change Between Stops!\n================================\nFrame IDs are NOT stable across different stop events:\n- After EACH stop (breakpoint, step, continue), frame IDs change\n- ALWAYS call debugger_stack_trace fresh after each stop\n- NEVER reuse frame IDs from previous stops\n\nEXAMPLE PATTERN:\n  // Stop 1: Hit breakpoint — inspect variables\n  debugger_wait_for_stop()\n  debugger_get_variables({sessionId})  // auto-resolves frame, returns locals\n  \n  // Or if you need a specific frame:\n  stack = debugger_stack_trace()\n  debugger_get_variables({sessionId, frameId: stack.stackFrames[1].id})  // caller frame\n\nWORKFLOW:\n1. Session must be in 'Stopped' state (e.g., at a breakpoint)\n2. Call this tool to get current stack frames\n3. Use frame IDs with debugger_get_variables (to inspect variables) or debugger_evaluate (for expressions)\n4. Repeat after each new stop event\n\nTIMING: Returns in 10-50ms depending on stack depth\n\nTIP: The first frame (index 0) is the current execution point. Higher indices are caller frames.\n\nCOMMON USE CASES:\n- Get frame IDs for debugger_get_variables or debugger_evaluate\n- Inspect where a breakpoint was hit\n- Understand call hierarchy\n- Diagnose unexpected execution paths\n\nSEE ALSO: debugger_get_variables (preferred for variable inspection), debugger_evaluate (for expressions only)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1576,7 +1664,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_evaluate",
                 "title": "Evaluate Expression",
-                "description": "Evaluates an expression in the context of the paused program. Can access variables, call functions, and perform computations using the program's current state.\n\n⚠️ CRITICAL: frameId Requirement\n================================\nWhile technically optional, frameId is REQUIRED in practice for accessing local variables:\n\n❌ WITHOUT frameId:\n  debugger_evaluate({expression: \"local_var\"})\n  → Result: NameError: name 'local_var' is not defined\n  \n  Why: Evaluates in global/default context where local variables don't exist\n\n✅ WITH frameId (REQUIRED WORKFLOW):\n  1. Get stack trace: stack = debugger_stack_trace()\n  2. Extract frame ID: frameId = stack.stackFrames[0].id\n  3. Evaluate with frameId:\n     debugger_evaluate({expression: \"local_var\", frameId: frameId})\n  → Result: Successfully accesses local variable ✓\n\n⚠️ Frame IDs Change Between Stops!\n  - Frame IDs are NOT stable across different stop events\n  - ALWAYS get a fresh stack trace after each stop\n  - NEVER reuse frame IDs from previous stops\n\nEXAMPLE PATTERN (Correct Way):\n  // After hitting breakpoint:\n  const stack = debugger_stack_trace()\n  const frameId = stack.stackFrames[0].id  // Current frame\n  const value = debugger_evaluate({expression: \"n\", frameId: frameId})\n  \n  // After next stop, get NEW frame ID:\n  const stack2 = debugger_stack_trace()  // Fresh trace!\n  const frameId2 = stack2.stackFrames[0].id  // New frame ID\n  const value2 = debugger_evaluate({expression: \"n\", frameId: frameId2})\n\nWORKFLOW:\n1. Session must be in 'Stopped' state\n2. Call debugger_stack_trace to get current stack frames\n3. Extract frame ID from desired frame (usually frame[0] for current location)\n4. Call this tool with expression AND frameId\n5. Examine the result value\n\nTIMING: Returns in 20-200ms depending on expression complexity\n\nEXPRESSION EXAMPLES:\n- Variable access: \"x\", \"obj.property\", \"array[0]\"\n- Arithmetic: \"x + y\", \"count * 2\"\n- Comparisons: \"x > 10\", \"status == 'ready'\"\n- Function calls: \"len(array)\", \"obj.method()\"\n- Complex: \"[item for item in list if item > 0]\" (Python)\n\nRETURNS: {\"result\": \"string representation of evaluation result\"}\n\nCOMMON ERROR:\n  \"NameError: name 'variable' is not defined\"\n  → Solution: Add frameId parameter from debugger_stack_trace\n\nSEE ALSO: debugger_stack_trace (get frame IDs), debugger://patterns (cookbook examples)",
+                "description": "WARNING: Do NOT use this to read variable values — use debugger_get_variables instead.\nThis tool is for EXPRESSIONS only: arithmetic (x + y), comparisons (x > 10), function calls\n(len(arr)), type casts. Evaluating container variable names (Vec, HashMap, String) triggers\nthe expression compiler, which can consume GBs of memory and crash the debug session.\n\nEvaluates an expression in the context of the paused program. Can call functions and perform computations using the program's current state.\n\n⚠️ CRITICAL: frameId Requirement\n================================\nWhile technically optional, frameId is REQUIRED in practice for accessing local variables:\n\n❌ WITHOUT frameId:\n  debugger_evaluate({expression: \"local_var\"})\n  → Result: NameError: name 'local_var' is not defined\n  \n  Why: Evaluates in global/default context where local variables don't exist\n\n✅ WITH frameId (REQUIRED WORKFLOW):\n  1. Get stack trace: stack = debugger_stack_trace()\n  2. Extract frame ID: frameId = stack.stackFrames[0].id\n  3. Evaluate with frameId:\n     debugger_evaluate({expression: \"local_var\", frameId: frameId})\n  → Result: Successfully accesses local variable ✓\n\n⚠️ Frame IDs Change Between Stops!\n  - Frame IDs are NOT stable across different stop events\n  - ALWAYS get a fresh stack trace after each stop\n  - NEVER reuse frame IDs from previous stops\n\nEXAMPLE PATTERN (Correct Way):\n  // After hitting breakpoint:\n  const stack = debugger_stack_trace()\n  const frameId = stack.stackFrames[0].id  // Current frame\n  const value = debugger_evaluate({expression: \"n\", frameId: frameId})\n  \n  // After next stop, get NEW frame ID:\n  const stack2 = debugger_stack_trace()  // Fresh trace!\n  const frameId2 = stack2.stackFrames[0].id  // New frame ID\n  const value2 = debugger_evaluate({expression: \"n\", frameId: frameId2})\n\nWORKFLOW:\n1. Session must be in 'Stopped' state\n2. Call debugger_stack_trace to get current stack frames\n3. Extract frame ID from desired frame (usually frame[0] for current location)\n4. Call this tool with expression AND frameId\n5. Examine the result value\n\nTIMING: Returns in 20-200ms depending on expression complexity\n\nEXPRESSION EXAMPLES:\n- Variable access: \"x\", \"obj.property\", \"array[0]\"\n- Arithmetic: \"x + y\", \"count * 2\"\n- Comparisons: \"x > 10\", \"status == 'ready'\"\n- Function calls: \"len(array)\", \"obj.method()\"\n- Complex: \"[item for item in list if item > 0]\" (Python)\n\nRETURNS: {\"result\": \"string representation of evaluation result\"}\n\nCOMMON ERROR:\n  \"NameError: name 'variable' is not defined\"\n  → Solution: Add frameId parameter from debugger_stack_trace\n\nSEE ALSO: debugger_stack_trace (get frame IDs), debugger://patterns (cookbook examples)",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1607,6 +1695,50 @@ impl ToolsHandler {
                     "category": "debugging",
                     "requiresState": ["Stopped"],
                     "priority": 0.5
+                }
+            }),
+            json!({
+                "name": "debugger_get_variables",
+                "title": "Get Variables (Safe Inspection)",
+                "description": "PREFERRED way to inspect variables. Reads directly from debug info (DWARF) — no expression compilation, no memory explosion, safe for any container size.\n\nWARNING: Do NOT use debugger_evaluate to read variable values. Use this tool instead.\ndebuger_evaluate triggers the expression compiler (JIT) which can consume GBs of memory\nfor large containers (Vec, HashMap). This tool reads directly from memory and is safe.\n\nUse debugger_evaluate ONLY for expressions: arithmetic (x + y), comparisons (x > 10),\nfunction calls (len(arr)). Never for bare variable names.\n\nTWO MODES:\n1. Scope locals (frameId): Get all local variables in the current frame\n   debugger_get_variables({sessionId})  // auto-resolves frame\n   debugger_get_variables({sessionId, frameId: 1001})\n   debugger_get_variables({sessionId, scope: \"Globals\"})\n\n2. Drill-down (variablesReference): Expand a specific variable's children\n   debugger_get_variables({sessionId, variablesReference: 42, maxCount: 10})\n\nWORKFLOW:\n  // 1. Get locals\n  vars = debugger_get_variables({sessionId})\n  // vars.variables: [{name: \"big_vec\", value: \"size=10000\", expandable: true, variablesReference: 42}, ...]\n\n  // 2. Drill into expandable variable\n  children = debugger_get_variables({sessionId, variablesReference: 42, maxCount: 10})\n  // children.variables: [{name: \"[0]\", value: \"0\", ...}, ...]\n\nFILTERING:\n  filter: \"indexed\" — array elements only (e.g., Vec, array indices)\n  filter: \"named\" — struct fields / properties only (e.g., HashMap internals)\n\nRETURNS:\n  { variables: [...], count: N, truncated: bool, hint?: \"...\" }\n  Each variable: { name, value, type, variablesReference, expandable }\n  expandable=true means you can drill deeper with variablesReference.\n  truncated=true means there are more items (increase maxCount or paginate).\n\nNOTE: variablesReference values are only valid while the program is stopped at the\ncurrent location. After continue/step, get fresh variables.\n\nTIMING: 10-100ms",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        },
+                        "frameId": {
+                            "type": "integer",
+                            "description": "Stack frame ID from debugger_stack_trace. If omitted, auto-resolves to current frame."
+                        },
+                        "variablesReference": {
+                            "type": "integer",
+                            "description": "Reference to expand a variable's children (from a previous get_variables result). Takes precedence over frameId."
+                        },
+                        "maxCount": {
+                            "type": "integer",
+                            "description": "Maximum number of variables to return (default: 50, max: 200)"
+                        },
+                        "scope": {
+                            "type": "string",
+                            "description": "Scope name to inspect: 'Locals' (default), 'Globals', 'Registers', etc. Only used with frameId mode."
+                        },
+                        "filter": {
+                            "type": "string",
+                            "description": "Filter: 'indexed' for array elements, 'named' for struct fields. Omit for all.",
+                            "enum": ["indexed", "named"]
+                        }
+                    },
+                    "required": ["sessionId"]
+                },
+                "annotations": {
+                    "async": false,
+                    "returnsTiming": "10-100ms",
+                    "workflow": "inspection",
+                    "category": "debugging",
+                    "requiresState": ["Stopped"],
+                    "priority": 0.7
                 }
             }),
             json!({
@@ -2022,7 +2154,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = ToolsHandler::list_tools();
-        assert_eq!(tools.len(), 19);
+        assert_eq!(tools.len(), 20);
 
         // Verify tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
@@ -2034,6 +2166,7 @@ mod tests {
         assert!(tool_names.contains(&"debugger_continue"));
         assert!(tool_names.contains(&"debugger_stack_trace"));
         assert!(tool_names.contains(&"debugger_evaluate"));
+        assert!(tool_names.contains(&"debugger_get_variables"));
         assert!(tool_names.contains(&"debugger_disconnect"));
         assert!(tool_names.contains(&"debugger_wait_for_stop"));
         assert!(tool_names.contains(&"debugger_list_breakpoints"));
@@ -2392,4 +2525,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_is_bare_identifier_true() {
+        assert!(is_bare_identifier("big_vec"));
+        assert!(is_bare_identifier("my_var"));
+        assert!(is_bare_identifier("x"));
+        assert!(is_bare_identifier("HashMap2"));
+        assert!(is_bare_identifier("_private"));
+        assert!(is_bare_identifier("  x  "));
+    }
+
+    #[test]
+    fn test_is_bare_identifier_false() {
+        assert!(!is_bare_identifier("x + 1"));
+        assert!(!is_bare_identifier("foo.bar"));
+        assert!(!is_bare_identifier("arr[0]"));
+        assert!(!is_bare_identifier("len(x)"));
+        assert!(!is_bare_identifier("x > 10"));
+        assert!(!is_bare_identifier("(int)x"));
+        assert!(!is_bare_identifier("a::b"));
+        assert!(!is_bare_identifier(""));
+        assert!(!is_bare_identifier("   "));
+    }
+
+    #[test]
+    fn test_evaluate_description_contains_memory_warning() {
+        let tools = ToolsHandler::list_tools();
+        let evaluate_tool = tools.iter().find(|t| t["name"] == "debugger_evaluate").unwrap();
+        let desc = evaluate_tool["description"].as_str().unwrap();
+        assert!(desc.contains("debugger_get_variables"), "evaluate description should mention debugger_get_variables");
+        assert!(desc.contains("GBs of memory"), "evaluate description should warn about memory");
+    }
+
+    #[test]
+    fn test_get_variables_tool_has_higher_priority_than_evaluate() {
+        let tools = ToolsHandler::list_tools();
+        let get_vars = tools.iter().find(|t| t["name"] == "debugger_get_variables").unwrap();
+        let evaluate = tools.iter().find(|t| t["name"] == "debugger_evaluate").unwrap();
+        let get_vars_priority = get_vars["annotations"]["priority"].as_f64().unwrap();
+        let evaluate_priority = evaluate["annotations"]["priority"].as_f64().unwrap();
+        assert!(get_vars_priority > evaluate_priority, "get_variables should have higher priority than evaluate");
+    }
 }

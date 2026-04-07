@@ -119,6 +119,12 @@ pub struct DebugSession {
     /// Ring buffer of captured program output (stdout/stderr/console)
     pub(crate) output_buffer: Arc<RwLock<VecDeque<OutputEntry>>>,
     output_line_counter: Arc<AtomicUsize>,
+    /// PID of the debug adapter process (for supervisor monitoring).
+    /// Set after spawning the adapter; None for socket-only adapters.
+    pub(crate) adapter_pid: Option<u32>,
+    /// Last tool call description, used by the supervisor to craft
+    /// context-aware error messages when the adapter is killed.
+    pub(crate) last_tool_context: Arc<RwLock<Option<String>>>,
 }
 
 impl DebugSession {
@@ -140,6 +146,8 @@ impl DebugSession {
             pending_breakpoints: Arc::new(RwLock::new(HashMap::new())),
             output_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_OUTPUT_LINES))),
             output_line_counter: Arc::new(AtomicUsize::new(0)),
+            adapter_pid: None,
+            last_tool_context: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -162,6 +170,8 @@ impl DebugSession {
             pending_breakpoints: Arc::new(RwLock::new(HashMap::new())),
             output_buffer: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_OUTPUT_LINES))),
             output_line_counter: Arc::new(AtomicUsize::new(0)),
+            adapter_pid: None,
+            last_tool_context: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -1251,26 +1261,98 @@ impl DebugSession {
         client.set_data_breakpoints(breakpoints).await
     }
 
+    /// Fetch raw variables from a scope, without child expansion.
+    /// `scope_name`: if Some, find scope by name (case-insensitive); otherwise pick first non-expensive scope.
+    /// If all scopes are expensive, falls back to the first scope (max_count protects us).
+    pub async fn get_scope_variables(
+        &self,
+        frame_id: i32,
+        scope_name: Option<&str>,
+        max_count: i32,
+    ) -> Result<Vec<crate::dap::types::Variable>> {
+        let mut scopes = self.scopes(frame_id).await?;
+        if scopes.is_empty() {
+            return Err(crate::Error::Dap("No scopes available for this frame".to_string()));
+        }
+
+        let scope = if let Some(name) = scope_name {
+            let name_lower = name.to_lowercase();
+            let idx = scopes.iter()
+                .position(|s| s.name.to_lowercase() == name_lower)
+                .ok_or_else(|| crate::Error::Dap(format!("Scope '{}' not found", name)))?;
+            scopes.swap_remove(idx)
+        } else {
+            match scopes.iter().position(|s| !s.expensive) {
+                Some(idx) => scopes.swap_remove(idx),
+                None => {
+                    warn!("All scopes are expensive, using first scope with max_count protection");
+                    scopes.swap_remove(0)
+                }
+            }
+        };
+
+        let max_count = max_count.min(200);
+        self.get_variable_children(scope.variables_reference, None, max_count).await
+    }
+
+    /// Fetch children of a variablesReference, with optional filter and count limit.
+    /// `filter`: "indexed" for array elements, "named" for struct fields, None for all.
+    pub async fn get_variable_children(
+        &self,
+        variables_reference: i32,
+        filter: Option<&str>,
+        max_count: i32,
+    ) -> Result<Vec<crate::dap::types::Variable>> {
+        if variables_reference <= 0 {
+            return Err(crate::Error::Dap(format!(
+                "Invalid variablesReference: {}. Must be > 0.", variables_reference
+            )));
+        }
+        let max_count = max_count.min(200);
+
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+
+        let timeout = std::time::Duration::from_secs(5);
+        let variables = tokio::time::timeout(
+            timeout,
+            client.variables_limited(variables_reference, Some(max_count), filter),
+        )
+        .await
+        .map_err(|_| crate::Error::Dap("Timeout fetching variables".to_string()))??;
+
+        // Client-side truncation: CodeLLDB ignores the count parameter.
+        Ok(variables.into_iter().take(max_count as usize).collect())
+    }
+
+    /// Fetch local variables with optional child expansion (used by stack trace enrichment).
+    /// Delegates to get_scope_variables + expand_variable.
     pub async fn get_local_variables(&self, frame_id: i32, expand_depth: u32) -> Result<Vec<crate::dap::types::Variable>> {
         let scopes = self.scopes(frame_id).await?;
 
         let scope = match scopes.into_iter().find(|s| !s.expensive) {
             Some(s) => s,
-            None => return Ok(Vec::new()),
+            None => {
+                warn!("All scopes are expensive, using first scope with count limit");
+                return self.get_scope_variables(frame_id, None, 20).await;
+            }
         };
 
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
 
         let timeout = std::time::Duration::from_secs(5);
-        let variables = tokio::time::timeout(timeout, client.variables(scope.variables_reference))
-            .await
-            .map_err(|_| crate::Error::Dap("Timeout fetching local variables".to_string()))??;
+        let variables = tokio::time::timeout(
+            timeout,
+            client.variables_limited(scope.variables_reference, Some(30), None),
+        )
+        .await
+        .map_err(|_| crate::Error::Dap("Timeout fetching local variables".to_string()))??;
 
         let mut result = Vec::new();
         for var in variables.into_iter().take(20) {
             if expand_depth > 0 && var.variables_reference > 0 {
-                let expand_timeout = std::time::Duration::from_secs(2);
+                let expand_timeout = std::time::Duration::from_secs(3);
                 match tokio::time::timeout(expand_timeout, client.expand_variable(var.variables_reference, expand_depth)).await {
                     Ok(Ok(expanded)) if !expanded.is_empty() => {
                         result.push(crate::dap::types::Variable {
@@ -1330,6 +1412,15 @@ impl DebugSession {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
         client.evaluate(expression, frame_id, context).await
+    }
+
+    /// Cancel all pending DAP requests on this session's debug client.
+    /// Used for recovery after a timed-out evaluate/variables request
+    /// so that subsequent operations can proceed.
+    pub async fn cancel_pending_requests(&self) {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        client.cancel_pending_requests().await;
     }
 
     pub async fn disconnect(&self) -> Result<()> {

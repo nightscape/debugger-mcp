@@ -18,6 +18,7 @@ tokio = { version = "1.47.1", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
+sysinfo = "0.35"
 
 [dev-dependencies]
 tempfile = "3.23.0"
@@ -26,6 +27,7 @@ mockall = "0.13.1"
 assert_matches = "1.5.0"
 assert_cmd = "2.0"
 predicates = "3.1"
+sysinfo = "0.35"
 
 [[test]]
 name = "fake_dap_adapter"
@@ -96,3 +98,18 @@ path = "tests/integration/rust_proptest_test.rs"
 [[test]]
 name = "rust_init_test"
 path = "tests/integration/lang/rust_init_test.rs"
+
+# Extended Rust integration tests (timeout/stuck, variable inspection, stepping)
+[[test]]
+name = "rust_extended_test"
+path = "tests/integration/lang/rust_extended_test.rs"
+
+# Timeout and stuck debugger tests (Python)
+[[test]]
+name = "timeout_stuck_test"
+path = "tests/integration/core/timeout_stuck_test.rs"
+
+# Memory explosion test (CodeLLDB + large data structures)
+[[test]]
+name = "memory_explosion_test"
+path = "tests/integration/core/memory_explosion_test.rs"

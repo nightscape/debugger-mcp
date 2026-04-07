@@ -15,6 +15,8 @@ use tracing::{error, info};
 /// Session Manager - manages multiple debug sessions
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<String, Arc<DebugSession>>>>,
+    /// RSS limit in MB for the process supervisor (None = default 512MB).
+    supervisor_rss_limit_mb: Option<u64>,
 }
 
 impl Default for SessionManager {
@@ -27,7 +29,14 @@ impl SessionManager {
     pub fn new() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            supervisor_rss_limit_mb: None,
         }
+    }
+
+    /// Set a custom RSS limit for the process supervisor (in MB).
+    /// Mainly useful for testing.
+    pub fn set_supervisor_rss_limit(&mut self, limit_mb: u64) {
+        self.supervisor_rss_limit_mb = Some(limit_mb);
     }
 
     pub async fn create_session(
@@ -388,6 +397,9 @@ impl SessionManager {
 
                     let adapter_id = RustAdapter::adapter_id();
 
+                    // Capture adapter PID before consuming the socket
+                    let adapter_pid = rust_session.process.id();
+
                     // Create DAP client from socket (like Ruby/Go)
                     let client = DapClient::from_socket(rust_session.socket)
                         .await
@@ -395,9 +407,10 @@ impl SessionManager {
                             adapter.log_connection_error(e);
                         })?;
 
-                    // Create session
-                    let session =
+                    // Create session with adapter PID for supervisor monitoring
+                    let mut session =
                         DebugSession::new(language.to_string(), program.clone(), client).await?;
+                    session.adapter_pid = adapter_pid;
                     let session_id = session.id.clone();
 
                     // Store session immediately
@@ -405,6 +418,16 @@ impl SessionManager {
                     {
                         let mut sessions = self.sessions.write().await;
                         sessions.insert(session_id.clone(), session_arc.clone());
+                    }
+
+                    // Spawn memory supervisor for the adapter process
+                    if let Some(pid) = adapter_pid {
+                        super::supervisor::spawn_supervisor(
+                            pid,
+                            session_arc.state.clone(),
+                            session_arc.last_tool_context.clone(),
+                            self.supervisor_rss_limit_mb,
+                        );
                     }
 
                     // Log workaround application (Rust doesn't require workarounds)

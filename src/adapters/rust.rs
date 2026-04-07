@@ -106,6 +106,16 @@ impl RustAdapter {
     /// the LLDB commands to load those formatters. If the toolchain is not found,
     /// returns empty (debugging still works, just without pretty-printing).
     fn rust_lldb_init_commands() -> Vec<String> {
+        let mut commands = vec![
+            // Limit children enumeration to prevent memory explosion.
+            // Without this, LLDB materialises ALL children of Vec/HashMap/BTreeMap
+            // when producing variable summaries, causing multi-GB RSS for large
+            // collections.  20 is enough for the AI to see the shape of the data.
+            "settings set target.max-children-count 20".to_string(),
+            // Limit string summary length to prevent large string allocations.
+            "settings set target.max-string-summary-length 256".to_string(),
+        ];
+
         // Try to find Rust sysroot via rustc
         let sysroot = std::process::Command::new("rustc")
             .arg("--print")
@@ -124,7 +134,7 @@ impl RustAdapter {
 
         let Some(sysroot) = sysroot else {
             debug!("🦀 [RUST] Could not determine rustc sysroot, skipping LLDB formatters");
-            return vec![];
+            return commands;
         };
 
         let etc_dir = format!("{}/lib/rustlib/etc", sysroot);
@@ -136,13 +146,13 @@ impl RustAdapter {
                 "🦀 [RUST] LLDB formatters not found at {}, skipping",
                 lookup_path
             );
-            return vec![];
+            return commands;
         }
 
         info!("🦀 [RUST] Loading Rust LLDB formatters from {}", etc_dir);
 
-        // Read the lldb_commands file and prepend the script import
-        let mut commands = vec![format!("command script import \"{}\"", lookup_path)];
+        // Load Rust-specific LLDB formatters
+        commands.push(format!("command script import \"{}\"", lookup_path));
 
         if let Ok(contents) = std::fs::read_to_string(&commands_path) {
             for line in contents.lines() {
@@ -1017,13 +1027,18 @@ mod tests {
 
         // If rustc is available, formatters should be loaded
         let commands = config["initCommands"].as_array().unwrap();
-        if !commands.is_empty() {
-            // First command should import lldb_lookup.py
-            let first = commands[0].as_str().unwrap();
+
+        // Memory safety settings should always be present
+        assert!(
+            commands.iter().any(|c| c.as_str().unwrap().contains("target.max-children-count")),
+            "Init commands should set target.max-children-count"
+        );
+
+        if commands.len() > 2 {
+            // Formatter commands follow the safety settings
             assert!(
-                first.contains("lldb_lookup.py"),
-                "First init command should import lldb_lookup.py, got: {}",
-                first
+                commands.iter().any(|c| c.as_str().unwrap().contains("lldb_lookup.py")),
+                "Init commands should import lldb_lookup.py"
             );
             // Should contain type formatter registrations
             assert!(

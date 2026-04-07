@@ -475,12 +475,37 @@ impl DapClient {
     /// Send a request with a timeout.
     /// On timeout, removes the orphaned entry from pending_requests to prevent
     /// stale requests from blocking subsequent operations.
+    ///
+    /// Before sending, cancels any orphaned pending requests from previous
+    /// timed-out operations. This is critical for recovery: if a previous
+    /// evaluate/variables request timed out while the adapter was still
+    /// processing it, the adapter may have since finished and sent a response
+    /// that went to a dropped receiver. Cleaning up first ensures we start
+    /// with a clean request pipeline.
     pub async fn send_request_with_timeout(
         &self,
         command: &str,
         arguments: Option<Value>,
         timeout: std::time::Duration,
     ) -> Result<Response> {
+        // Cancel any orphaned pending requests from previous timeouts.
+        // DAP adapters process requests serially, so a stuck previous request
+        // blocks all subsequent ones. By cleaning up orphans, we give the
+        // adapter a chance to process our new request.
+        {
+            let pending = self.pending_requests.read().await;
+            if !pending.is_empty() {
+                drop(pending);
+                let cancelled = self.cancel_pending_requests().await;
+                if cancelled > 0 {
+                    warn!(
+                        "⏱️  send_request_with_timeout: Cleaned up {} orphaned pending request(s) before sending '{}'",
+                        cancelled, command
+                    );
+                }
+            }
+        }
+
         info!(
             "⏱️  send_request_with_timeout: '{}' with timeout {:?}",
             command, timeout
@@ -601,6 +626,7 @@ impl DapClient {
             lines_start_at_1: Some(true),
             columns_start_at_1: Some(true),
             path_format: Some("path".to_string()),
+            supports_variable_paging: Some(true),
         };
 
         let response = self
@@ -1437,6 +1463,54 @@ impl DapClient {
         Ok(body.scopes)
     }
 
+    /// Fetch variables with optional count limit and filter.
+    /// When `max_count` is Some, uses DAP pagination to request at most that many children.
+    /// This prevents CodeLLDB/LLDB from materializing huge collections (Vec with 100k elements)
+    /// which can cause multi-GB memory usage.
+    /// `filter`: "indexed" for array elements, "named" for struct fields, None for all.
+    pub async fn variables_limited(&self, variables_reference: i32, max_count: Option<i32>, filter: Option<&str>) -> Result<Vec<Variable>> {
+        let args = VariablesArguments {
+            variables_reference,
+            filter: filter.map(|s| s.to_string()),
+            start: Some(0),
+            count: max_count,
+        };
+
+        let timeout = std::time::Duration::from_secs(10);
+        let response = self
+            .send_request_with_timeout("variables", Some(serde_json::to_value(args)?), timeout)
+            .await
+            .map_err(|e| Error::Dap(format!(
+                "variables request timed out after {timeout:?} (variablesReference={variables_reference}). \
+                 This often happens with large or deeply nested types (e.g. HashMap, Vec with many elements). \
+                 Try evaluating a specific field instead of the whole variable. \
+                 Original error: {e}"
+            )))?;
+
+        if !response.success {
+            return Err(Error::Dap(format!(
+                "Variables failed: {:?}",
+                response.message
+            )));
+        }
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct VariablesResponse {
+            variables: Vec<Variable>,
+        }
+
+        let body: VariablesResponse = response
+            .body
+            .ok_or_else(|| Error::Dap("No body in variables response".to_string()))
+            .and_then(|v| {
+                serde_json::from_value(v)
+                    .map_err(|e| Error::Dap(format!("Failed to parse variables: {}", e)))
+            })?;
+
+        Ok(body.variables)
+    }
+
     pub async fn variables(&self, variables_reference: i32) -> Result<Vec<Variable>> {
         let args = VariablesArguments {
             variables_reference,
@@ -1578,27 +1652,18 @@ impl DapClient {
         frame_id: Option<i32>,
         context: Option<String>,
     ) -> Result<String> {
-        let (result, variables_reference) =
+        let (result, _variables_reference) =
             self.evaluate_raw(expression, frame_id, context).await?;
 
-        // Auto-expand children when variablesReference > 0 (synthetic providers like HashMap, Vec, BTreeMap)
-        // Skip for strings — LLDB already shows the string content in the result summary
-        if variables_reference > 0 && !result.starts_with('"') {
-            let expand_timeout = std::time::Duration::from_secs(5);
-            match tokio::time::timeout(expand_timeout, self.expand_variable(variables_reference, 2)).await {
-                Ok(Ok(expanded)) if !expanded.is_empty() => {
-                    return Ok(format!("{}\n{}", result, expanded));
-                }
-                Err(_) => {
-                    warn!(
-                        "⚠️  Auto-expansion of '{}' timed out after {:?} — type is too large/nested. Returning summary only.",
-                        expression, expand_timeout
-                    );
-                    return Ok(format!("{}\n  (children omitted: auto-expansion timed out — try evaluating specific fields)", result));
-                }
-                _ => {}
-            }
-        }
+        // Do NOT auto-expand children via the `variables` DAP request.
+        // Many adapters (including CodeLLDB/LLDB) ignore the `count` pagination
+        // parameter and materialise ALL children in memory.  For a Vec with 10k
+        // elements or a HashMap with 5k entries this causes multi-GB RSS.
+        //
+        // The evaluate response already contains a summary string (e.g.
+        // "size=10000" for Vec, "size=5000" for HashMap).  If the caller needs
+        // to see individual elements, they should evaluate a specific index
+        // (e.g. "big_vec[0]") or field (e.g. "big_map[\"key\"]").
 
         Ok(result)
     }
@@ -1678,7 +1743,14 @@ impl DapClient {
         Ok((body.result, body.variables_reference))
     }
 
-    /// Recursively expand a variablesReference into a readable string
+    /// Maximum children to fetch per variable expansion level.
+    /// Prevents CodeLLDB/LLDB from materializing huge collections in memory.
+    /// A Vec<T> with 100k elements would otherwise cause multi-GB memory usage.
+    const MAX_CHILDREN_PER_LEVEL: i32 = 50;
+
+    /// Recursively expand a variablesReference into a readable string.
+    /// Caps children per level to MAX_CHILDREN_PER_LEVEL to prevent
+    /// memory explosion in the debug adapter.
     pub(crate) fn expand_variable(
         &self,
         variables_reference: i32,
@@ -1689,11 +1761,16 @@ impl DapClient {
                 return Ok(String::new());
             }
 
-            let children = self.variables(variables_reference).await?;
+            let children = self.variables_limited(
+                variables_reference,
+                Some(Self::MAX_CHILDREN_PER_LEVEL),
+                None,
+            ).await?;
             if children.is_empty() {
                 return Ok(String::new());
             }
 
+            let total_children = children.len();
             let mut lines = Vec::new();
             for child in &children {
                 // Skip [[raw]] entries — internal LLDB synthetic provider detail
@@ -1738,6 +1815,13 @@ impl DapClient {
                         child.name, child.value, type_str, child_expansion
                     ));
                 }
+            }
+
+            if total_children as i32 >= Self::MAX_CHILDREN_PER_LEVEL {
+                lines.push(format!(
+                    "  ... (showing first {} children, use specific field access for more)",
+                    Self::MAX_CHILDREN_PER_LEVEL
+                ));
             }
 
             Ok(lines.join("\n"))
@@ -2114,5 +2198,270 @@ mod tests {
             .unwrap();
 
         client.disconnect().await.unwrap();
+    }
+
+    // ========================================================================
+    // Channel-based mock transport for complex interaction testing
+    // ========================================================================
+
+    /// A mock transport where requests go out via a channel and responses
+    /// come back via another channel.  This lets a test task sit in the
+    /// middle, inspect each request, and decide what/when to respond.
+    struct ChannelTransport {
+        /// Requests written by the client arrive here (test reads them)
+        outgoing_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+        /// Responses fed by the test arrive here (client reads them)
+        incoming_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Message>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DapTransportTrait for ChannelTransport {
+        async fn read_message(&mut self) -> Result<Message> {
+            let mut rx = self.incoming_rx.lock().await;
+            rx.recv()
+                .await
+                .ok_or_else(|| Error::Dap("Channel closed".to_string()))
+        }
+        async fn write_message(&mut self, msg: &Message) -> Result<()> {
+            self.outgoing_tx
+                .send(msg.clone())
+                .map_err(|_| Error::Dap("Channel closed".to_string()))
+        }
+    }
+
+    struct ChannelTransportPair {
+        /// Send responses/events TO the client
+        incoming_tx: tokio::sync::mpsc::UnboundedSender<Message>,
+        /// Receive requests FROM the client
+        outgoing_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
+    }
+
+    fn create_channel_transport() -> (Box<ChannelTransport>, ChannelTransportPair) {
+        let (outgoing_tx, outgoing_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (incoming_tx, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let transport = Box::new(ChannelTransport {
+            outgoing_tx,
+            incoming_rx: tokio::sync::Mutex::new(incoming_rx),
+        });
+        let pair = ChannelTransportPair {
+            incoming_tx,
+            outgoing_rx,
+        };
+        (transport, pair)
+    }
+
+    /// Helper: receive the next request from the client, extracting the seq
+    async fn recv_request(pair: &mut ChannelTransportPair) -> (i32, String, Option<Value>) {
+        let msg = pair.outgoing_rx.recv().await.expect("channel closed");
+        match msg {
+            Message::Request(req) => (req.seq, req.command, req.arguments),
+            other => panic!("Expected request, got {:?}", other),
+        }
+    }
+
+    /// Helper: send a success response back to the client
+    fn send_response(pair: &ChannelTransportPair, request_seq: i32, command: &str, body: Option<Value>) {
+        pair.incoming_tx
+            .send(Message::Response(Response {
+                seq: 0,
+                request_seq,
+                command: command.to_string(),
+                success: true,
+                message: None,
+                body,
+            }))
+            .expect("send failed");
+    }
+
+    // ========================================================================
+    // Bug reproduction: expand_variable requests unlimited children
+    // ========================================================================
+
+    /// Reproduce: expand_variable must send `count` in the variables request
+    /// to prevent LLDB from materialising huge collections.
+    ///
+    /// The test creates a client whose "evaluate" returns a variablesReference,
+    /// then checks that the subsequent "variables" request includes a `count`
+    /// field (i.e. uses variables_limited, not the unbounded variables).
+    #[tokio::test]
+    async fn test_expand_variable_limits_children_count() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        // Run expand_variable(42, 1) in a task
+        let client2 = client.clone_for_callback();
+        let expand_handle = tokio::spawn(async move {
+            client2.expand_variable(42, 1).await
+        });
+
+        // The client should send a "variables" request for ref 42
+        let (seq, cmd, args) = recv_request(&mut pair).await;
+        assert_eq!(cmd, "variables");
+
+        // KEY ASSERTION: the request must include a `count` field
+        let args = args.expect("variables should have arguments");
+        assert!(
+            args.get("count").is_some() && !args["count"].is_null(),
+            "BUG REPRODUCED: variables request has no 'count' limit — \
+             this causes LLDB to materialise all children of large collections, \
+             leading to multi-GB memory usage. Got args: {}",
+            args
+        );
+
+        let count = args["count"].as_i64().unwrap();
+        assert!(
+            count <= 100,
+            "count should be reasonable (≤100), got {}",
+            count
+        );
+
+        // Respond with one child (no further expansion needed)
+        send_response(&pair, seq, "variables", Some(json!({
+            "variables": [{
+                "name": "x",
+                "value": "42",
+                "type": "i32",
+                "variablesReference": 0
+            }]
+        })));
+
+        let result = expand_handle.await.unwrap().unwrap();
+        assert!(result.contains("42"));
+    }
+
+    // ========================================================================
+    // Bug reproduction: evaluate timeout breaks session
+    // ========================================================================
+
+    /// Reproduce: after an evaluate times out, the adapter sends a late
+    /// response.  Without the fix, the orphaned pending entry has been removed
+    /// (good), but using `send_request` (no timeout) for the original request
+    /// leaves it permanently in pending.  This test uses `send_request` to
+    /// create a true orphan that `cancel_pending_requests` must clean up.
+    ///
+    /// Scenario:
+    /// 1. Client sends request via `send_request` (no timeout — hangs forever)
+    /// 2. Another task calls `cancel_pending_requests` (simulating recovery)
+    /// 3. Client sends a new request — it must succeed
+    ///
+    /// Without the `cancel_pending_requests` call, the new request would
+    /// work at the transport level but the orphaned entry would never be
+    /// cleaned, slowly leaking memory and potentially confusing seq matching.
+    #[tokio::test]
+    async fn test_session_recovers_after_request_timeout() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        // 1. Send a request that will never get a response (simulates hung evaluate)
+        let client_clone = client.clone_for_callback();
+        let _orphan_handle = tokio::spawn(async move {
+            let _ = client_clone
+                .send_request("evaluate", Some(json!({"expression": "slow"})))
+                .await;
+        });
+
+        // Consume the evaluate request
+        let (_seq, cmd, _) = recv_request(&mut pair).await;
+        assert_eq!(cmd, "evaluate");
+
+        // Give pending entry time to register
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify the orphan exists
+        let pending_before = client.pending_requests.read().await.len();
+        assert_eq!(pending_before, 1, "Should have 1 pending request (the orphan)");
+
+        // 2. Cancel pending requests (simulates the recovery path)
+        let cancelled = client.cancel_pending_requests().await;
+        assert_eq!(cancelled, 1, "Should cancel the orphaned evaluate");
+
+        // Drain any cancel requests sent
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while pair.outgoing_rx.try_recv().is_ok() {}
+
+        // 3. Send a NEW request — must succeed
+        let client_clone2 = client.clone_for_callback();
+        let recovery_handle = tokio::spawn(async move {
+            client_clone2
+                .send_request_with_timeout(
+                    "stackTrace",
+                    Some(json!({"threadId": 1})),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+
+        // Receive the stackTrace request
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        let received = tokio::time::timeout_at(deadline, recv_request(&mut pair)).await;
+
+        assert!(
+            received.is_ok(),
+            "stackTrace request should arrive after cleanup"
+        );
+
+        let (seq2, cmd2, _) = received.unwrap();
+        assert_eq!(cmd2, "stackTrace");
+
+        send_response(&pair, seq2, "stackTrace", Some(json!({
+            "stackFrames": [{"id": 1, "name": "main", "line": 10, "column": 0}]
+        })));
+
+        let recovery_result: Result<Response> = recovery_handle.await.unwrap();
+        assert!(
+            recovery_result.is_ok(),
+            "stackTrace should succeed after cancel_pending_requests, got: {:?}",
+            recovery_result.err()
+        );
+
+        // Verify no orphans remain
+        let pending_after = client.pending_requests.read().await.len();
+        assert_eq!(pending_after, 0, "No orphans should remain");
+    }
+
+    // ========================================================================
+    // Bug reproduction: cancel_pending_requests cleans up orphans
+    // ========================================================================
+
+    /// Verify that cancel_pending_requests drops orphaned entries
+    /// so they don't interfere with new requests.
+    #[tokio::test]
+    async fn test_cancel_pending_requests_cleans_orphans() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        // Send a request that will never get a response
+        let client_clone = client.clone_for_callback();
+        let _orphan_handle = tokio::spawn(async move {
+            // This will hang forever since we won't respond
+            let _ = client_clone
+                .send_request("evaluate", Some(json!({"expression": "hang"})))
+                .await;
+        });
+
+        // Consume the request
+        let (_seq, cmd, _) = recv_request(&mut pair).await;
+        assert_eq!(cmd, "evaluate");
+
+        // Give the pending entry time to be registered
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Now cancel_pending_requests should clean it up
+        let cancelled = client.cancel_pending_requests().await;
+        assert_eq!(cancelled, 1, "Should have cancelled 1 orphaned request");
+
+        // Consume the cancel request if sent
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while pair.outgoing_rx.try_recv().is_ok() {}
+
+        // Verify pending map is now empty
+        let pending_count = client.pending_requests.read().await.len();
+        assert_eq!(pending_count, 0, "Pending requests should be empty after cancel");
     }
 }

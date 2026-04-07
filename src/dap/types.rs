@@ -57,6 +57,9 @@ pub struct InitializeRequestArguments {
     pub lines_start_at_1: Option<bool>,
     pub columns_start_at_1: Option<bool>,
     pub path_format: Option<String>,
+    /// Tell the adapter we support variable paging so it honors
+    /// `start`/`count` in variables requests.
+    pub supports_variable_paging: Option<bool>,
 }
 
 /// Capabilities returned by initialize

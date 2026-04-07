@@ -2,6 +2,7 @@ pub mod manager;
 pub mod multi_session;
 pub mod session;
 pub mod state;
+pub mod supervisor;
 
 pub use manager::SessionManager;
 pub use multi_session::{ChildSession, MultiSessionManager};
