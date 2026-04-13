@@ -47,10 +47,11 @@ impl McpServer {
         loop {
             match self.transport.read_message().await {
                 Ok(msg) => {
-                    let response = self.handler.handle_message(msg).await;
-                    if let Err(e) = self.transport.write_message(&response).await {
-                        error!("Failed to write response: {}", e);
-                        return Err(e);
+                    if let Some(response) = self.handler.handle_message(msg).await {
+                        if let Err(e) = self.transport.write_message(&response).await {
+                            error!("Failed to write response: {}", e);
+                            return Err(e);
+                        }
                     }
                 }
                 Err(e) => {

@@ -49,3 +49,4 @@ codex-last-message.txt
 
 # Python cache
 tests/fixtures/__pycache__/
+.code-graph/

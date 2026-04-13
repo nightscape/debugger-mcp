@@ -186,6 +186,13 @@ pub struct EvaluateArgs {
     #[serde(default, deserialize_with = "deserialize_optional_int_or_string")]
     pub frame_id: Option<i32>,
     pub context: Option<String>,
+    /// When true, prepend `?` to the expression so CodeLLDB disables synthetic
+    /// children for this eval. Lets a scalar field path (`state.c.length`) read
+    /// the raw struct field without the expression compiler walking the
+    /// surrounding container's synthetic view first. No-op on adapters that
+    /// don't recognise the prefix.
+    #[serde(default)]
+    pub no_synthetic: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -293,6 +300,13 @@ pub struct GetVariablesArgs {
     pub max_count: Option<i32>,
     pub scope: Option<String>,
     pub filter: Option<String>,
+    /// CodeLLDB raw mode: when true, sets `format.showRaw=true` on the DAP
+    /// variables request so synthetic-children providers are bypassed and the
+    /// underlying struct fields are returned. Use this to read scalar fields
+    /// (`length`, `len`, `bucket_mask`) off large containers without paying
+    /// the per-element materialisation cost.
+    #[serde(default)]
+    pub no_synthetic: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,20 +578,38 @@ impl ToolsHandler {
         // For Rust, allow both .rs source files and pre-compiled binaries (no extension)
         // For others, validate with expected source file extension
         let validated_program = if args.language == "rust" {
-            // Rust special case: Allow both .rs files and executables
-            // First validate without extension requirement
-            let path = security::validate_source_path(&args.program, None)?;
+            // Rust: accept .rs files, executables, Cargo.toml, or directories containing Cargo.toml
+            let path = std::path::Path::new(&args.program);
 
-            // Then check it's either .rs or an executable (no extension or common executable extensions)
-            let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
-            if !ext.is_empty() && ext != "rs" {
-                return Err(Error::Compilation(format!(
-                    "Invalid Rust program path. Expected .rs source file or executable, got .{} file: {}",
-                    ext,
-                    path.display()
-                )));
+            if path.is_dir() {
+                // Directory: validate it contains a Cargo.toml
+                let validated_dir = security::validate_directory_path(&args.program)?;
+                let manifest = validated_dir.join("Cargo.toml");
+                if !manifest.exists() {
+                    return Err(Error::Compilation(format!(
+                        "Directory does not contain Cargo.toml: {}",
+                        validated_dir.display()
+                    )));
+                }
+                manifest
+            } else {
+                let validated = security::validate_source_path(&args.program, None)?;
+                let ext = validated.extension().and_then(|s| s.to_str()).unwrap_or("");
+                if !ext.is_empty() && ext != "rs" && ext != "toml" {
+                    return Err(Error::Compilation(format!(
+                        "Invalid Rust program path. Expected .rs source file, Cargo.toml, directory, or executable, got .{} file: {}",
+                        ext,
+                        validated.display()
+                    )));
+                }
+                if ext == "toml" && !validated.ends_with("Cargo.toml") {
+                    return Err(Error::Compilation(format!(
+                        "Invalid .toml file. Expected Cargo.toml, got: {}",
+                        validated.display()
+                    )));
+                }
+                validated
             }
-            path
         } else {
             // Other languages: Validate with expected extension
             let extension = match args.language.as_str() {
@@ -903,9 +935,19 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
+        // CodeLLDB convention: a leading `?` disables synthetic children for
+        // this eval. Add it now (the dap-client stripper handles the wire form
+        // and `format.showRaw`). Idempotent — if the caller already wrote
+        // `?expr`, leave it alone.
+        let expression = if args.no_synthetic && !args.expression.starts_with('?') {
+            format!("?{}", args.expression)
+        } else {
+            args.expression.clone()
+        };
+
         // Record context for supervisor diagnostics
         *session.last_tool_context.write().await =
-            Some(format!("debugger_evaluate expression=\"{}\"", args.expression));
+            Some(format!("debugger_evaluate expression=\"{}\"", expression));
 
         // Validate we're in a stopped state
         let state = session.get_state().await;
@@ -916,12 +958,26 @@ impl ToolsHandler {
         }
 
         let context_str = args.context.as_deref().unwrap_or("watch");
+        // Bare-identifier warning checks the user's intent (the original
+        // expression), not the wire form — `?x` and `x` should both warn.
         let warn_bare_id = context_str != "repl"
             && context_str != "variables"
             && is_bare_identifier(&args.expression);
+        let is_repl = context_str == "repl";
+
+        // Snapshot output line counter so we can attribute LLDB stdout/stderr
+        // emitted *during* this evaluate to the response. Without this, REPL
+        // commands like `frame variable`, `version`, `help` look identical to
+        // a silent drop because their output flows through OutputEvents, not
+        // the evaluate response body.
+        let output_snapshot = if is_repl {
+            Some(session.current_output_line())
+        } else {
+            None
+        };
 
         let result = session
-            .evaluate(&args.expression, args.frame_id, args.context)
+            .evaluate(&expression, args.frame_id, args.context)
             .await;
 
         match result {
@@ -934,6 +990,49 @@ impl ToolsHandler {
                          for containers (Vec, HashMap). debugger_get_variables reads directly from debug info \
                          and is safe for any size."
                     );
+                }
+                if let Some(since) = output_snapshot {
+                    // For REPL passthrough, drain entries produced after the
+                    // call started. The "console" category is where CodeLLDB
+                    // routes LLDB command output; "stderr" carries error text.
+                    // Both are surfaced — the caller decides what to do with
+                    // them.
+                    let entries = session.get_output(None, None, 1000, Some(since)).await;
+                    let mut combined = String::new();
+                    let mut stderr_buf = String::new();
+                    for e in &entries {
+                        match e.category.as_str() {
+                            "stderr" => stderr_buf.push_str(&e.output),
+                            // console / stdout / important / telemetry / "" all flow into the
+                            // primary stream, mirroring what a human would see in DAP-aware IDEs.
+                            _ => combined.push_str(&e.output),
+                        }
+                    }
+                    if !combined.is_empty() {
+                        resp["output"] = json!(combined);
+                    }
+                    if !stderr_buf.is_empty() {
+                        resp["stderr"] = json!(stderr_buf);
+                    }
+                    // Either the result body, the output, or stderr should
+                    // carry signal. If all three are empty, the response is
+                    // ambiguous — flag it explicitly so callers can tell the
+                    // difference between "command produced nothing" and
+                    // "transport silently dropped the output".
+                    let result_empty = resp["result"]
+                        .as_str()
+                        .map(|s| s.is_empty())
+                        .unwrap_or(true);
+                    if result_empty && combined.is_empty() && stderr_buf.is_empty() {
+                        resp["note"] = json!(
+                            "REPL command returned no result body and produced no output \
+                             on either stream. This usually means the command exists but \
+                             intentionally produces nothing (e.g. `settings set` with a \
+                             blank value), but it may also indicate a transport drop. Try \
+                             `version` to confirm the channel is alive."
+                        );
+                        resp["empty"] = json!(true);
+                    }
                 }
                 Ok(resp)
             }
@@ -1043,7 +1142,24 @@ impl ToolsHandler {
     async fn debugger_run_to_crash(&self, arguments: Value) -> Result<Value> {
         let args: RunToCrashArgs = serde_json::from_value(arguments)?;
 
-        let validated_program = security::validate_source_path(&args.program, None)?;
+        let validated_program = if args.language == "rust" {
+            let path = std::path::Path::new(&args.program);
+            if path.is_dir() {
+                let validated_dir = security::validate_directory_path(&args.program)?;
+                let manifest = validated_dir.join("Cargo.toml");
+                if !manifest.exists() {
+                    return Err(Error::Compilation(format!(
+                        "Directory does not contain Cargo.toml: {}",
+                        validated_dir.display()
+                    )));
+                }
+                manifest
+            } else {
+                security::validate_source_path(&args.program, None)?
+            }
+        } else {
+            security::validate_source_path(&args.program, None)?
+        };
         let program = validated_program
             .to_str()
             .ok_or_else(|| Error::Internal("Non-UTF8 program path".to_string()))?
@@ -1392,7 +1508,7 @@ impl ToolsHandler {
         let filter = args.filter.as_deref();
 
         let variables = if let Some(var_ref) = args.variables_reference {
-            session.get_variable_children(var_ref, filter, max_count).await
+            session.get_variable_children(var_ref, filter, max_count, args.no_synthetic).await
         } else {
             // Resolve frame_id: use provided, or auto-fetch from stopped thread
             let frame_id = if let Some(fid) = args.frame_id {
@@ -1404,6 +1520,9 @@ impl ToolsHandler {
                 }
                 frames[0].id
             };
+            // The scope-level call only returns top-level locals (name/type/
+            // varRef), never their children — synthetic providers don't
+            // activate at this level, so `no_synthetic` would be a no-op.
             session.get_scope_variables(frame_id, args.scope.as_deref(), max_count).await
         };
 
@@ -1429,6 +1548,22 @@ impl ToolsHandler {
                 if has_expandable {
                     result["hint"] = json!("Use variablesReference with this tool to drill into expandable variables");
                 }
+                // Empty-locals signal: when called for a frame's locals scope
+                // (no variablesReference) and we got back nothing, it's almost
+                // always a stripped-DWARF build profile, not a function with
+                // genuinely no locals. Surface a hint pointing at the build
+                // settings so callers don't burn a stack-inspection round-trip
+                // figuring out why.
+                if json_vars.is_empty() && args.variables_reference.is_none() {
+                    result["dwarfStripped"] = json!(true);
+                    result["hint"] = json!(
+                        "Locals scope returned 0 variables. The most common cause is a \
+                         stripped-DWARF build profile (Cargo `debug = \"line-tables-only\"`, \
+                         rustc `-C debuginfo=1`, or release-without-debuginfo). Try a full \
+                         debug build or use debugger_evaluate on a specific name to confirm \
+                         — evaluate returns a clear LLDB diagnostic for stripped CUs."
+                    );
+                }
                 Ok(result)
             }
             Err(e) => {
@@ -1446,7 +1581,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_start",
                 "title": "Start Debugging Session",
-                "description": "Starts a new debugging session for a program.\n\nTIP: Call debugger_debugging_tips with the language BEFORE starting a session to learn about known debugger limitations and workarounds.\n\nDEBUGGING WORKFLOW — Choose the best approach:\n1. For crash investigation: use debugger_run_to_crash (single call, returns crash context)\n2. For state inspection at a line: use debugger_start + debugger_snapshot_at\n3. For stepping: step_over/into/out now return full context automatically\n\n⭐ RECOMMENDED: Pass breakpoints directly to avoid multiple round-trips:\n  debugger_start({program: \"app.py\", breakpoints: [{sourcePath: \"/abs/path/app.py\", line: 20}]})\n  debugger_wait_for_stop()  // Returns stack trace, variables, source context\n\nAll state-changing tools now return enriched context (stack, variables, source) automatically.\n\nSEE ALSO: debugger_run_to_crash, debugger_snapshot_at, debugger_trace_function",
+                "description": "Starts a debug session for a program in the given language. Pass `breakpoints` up front to avoid extra round-trips; see debugger://workflows for examples.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1456,7 +1591,7 @@ impl ToolsHandler {
                         },
                         "program": {
                             "type": "string",
-                            "description": "Absolute or relative path to the program file to debug"
+                            "description": "Path to the program to debug. For most languages: path to the source file. For Rust: path to a .rs file, a Cargo.toml, a directory containing Cargo.toml, or a pre-compiled binary."
                         },
                         "args": {
                             "type": "array",
@@ -1519,7 +1654,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_session_state",
                 "title": "Check Session State",
-                "description": "Retrieves the current state of a debugging session. Essential for tracking async initialization progress.\n\nWORKFLOW USAGE:\n- After debugger_start: Poll this until state is 'Running' or 'Stopped' (not 'Initializing')\n- Before setting breakpoints: Verify state is 'Stopped' (with stopOnEntry) or 'Running'\n- After operations: Check state to verify success or detect failures\n\nSTATES:\n- NotStarted: Session created but not yet initialized\n- Initializing: DAP adapter starting (wait for this to complete)\n- Launching: Program starting\n- Running: Program executing (can set breakpoints)\n- Stopped: Hit breakpoint or paused (details.reason shows why)\n- Terminated: Program exited normally\n- Failed: Error occurred (details.error shows message)\n\nTIMING: Returns immediately (<10ms)\n\nTIP: When state is 'Stopped', check details.reason to understand why (e.g., 'entry', 'breakpoint', 'step')\n\nSEE ALSO: debugger://state-machine (complete state diagram), debugger-docs://guide/async-initialization",
+                "description": "Returns the current session state: NotStarted, Initializing, Launching, Running, Stopped, Terminated, or Failed. See debugger://state-machine for transitions.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1542,7 +1677,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_set_breakpoint",
                 "title": "Set Breakpoint",
-                "description": "Sets a breakpoint at a specific line in a source file. The debugger will pause execution when this line is about to execute.\n\nWORKFLOW:\n1. Ensure session state is 'Stopped' (recommended) or 'Running'\n2. Call this tool with the source file path and line number\n3. Optionally add a condition, hitCondition, or activateAfter to control when the breakpoint fires\n4. Check the 'verified' field in response (true = breakpoint accepted)\n5. Use debugger_continue to resume execution until breakpoint is hit\n\nCONDITIONAL BREAKPOINTS:\n- condition: An expression evaluated at the breakpoint. Only pauses when truthy. Example: 'i > 100'\n- hitCondition: An expression evaluated against the hit count. Examples: '>= 5' (5th+ hit), '== 3' (only 3rd hit), '% 10' (every 10th hit)\n\nDEPENDENT BREAKPOINTS:\n- activateAfter: {sourcePath, line} — This breakpoint stays dormant until the specified breakpoint is hit first. Useful for debugging code that only matters after a certain execution point (e.g., activate a breakpoint in a handler only after the setup function runs). The dependency breakpoint must also be set.\n\nTIMING: Returns in 5-20ms\n\nIMPORTANT: Use stopOnEntry: true when starting the session to pause before code execution, giving you time to set breakpoints.\n\nTIP: The sourcePath must match the path used by the debugger. For best results, use absolute paths.\n\nRETURNS:\n- verified: true if breakpoint was successfully set and recognized by the debugger\n- sourcePath: echo of the source file path\n- line: echo of the line number\n- condition: echo of condition (if set)\n- hitCondition: echo of hitCondition (if set)\n- activateAfter: echo of dependency (if set)\n- status: 'pending_dependency' if waiting for dependency\n\nSEE ALSO: debugger_continue (to hit the breakpoint), debugger_list_breakpoints (shows active and dependent breakpoints)",
+                "description": "Sets a source breakpoint at `sourcePath:line`. Supports `condition` (truthy expression), `hitCondition` (hit-count expression like '>= 5'), and `activateAfter` (dormant until the trigger breakpoint fires). Requires session state Running or Stopped.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1596,7 +1731,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_continue",
                 "title": "Continue Execution",
-                "description": "Resumes program execution after being paused.\n\n⭐ RECOMMENDED: Use waitForStop: true to get full context in a single call:\n  debugger_continue({sessionId, waitForStop: true})\n  → Returns stack trace, local variables, and source context when stopped\n\nWithout waitForStop, returns immediately and you must poll separately.\n\nWhen stopped, check reason: 'breakpoint', 'exception', 'pause', 'step'\n\nSEE ALSO: debugger_run_to_crash (for crash investigation), debugger_snapshot_at (for state inspection)",
+                "description": "Resumes execution. Set `waitForStop: true` to block until the next stop and receive enriched context (stack trace, local variables, source).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1628,7 +1763,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_stack_trace",
                 "title": "Get Stack Trace",
-                "description": "Retrieves the current call stack when execution is paused. Shows the sequence of function calls that led to the current execution point.\n\n⭐ PRIMARY PURPOSE: Get Frame IDs for debugger_get_variables and debugger_evaluate\n======================================================\nThe 'id' field in each frame is used with debugger_get_variables (preferred) or debugger_evaluate (expressions only).\n\nTIP: debugger_get_variables can auto-resolve the frame ID, so you often don't need this tool just to inspect variables.\n\nRETURNS: Array of stack frames, each containing:\n- id: Frame identifier → USE THIS as frameId in debugger_get_variables or debugger_evaluate\n- name: Function/method name\n- source: {path: \"file path\", name: \"filename\"}\n- line: Current line number in this frame\n- column: Column number (if available)\n\n⚠️ Frame IDs Change Between Stops!\n================================\nFrame IDs are NOT stable across different stop events:\n- After EACH stop (breakpoint, step, continue), frame IDs change\n- ALWAYS call debugger_stack_trace fresh after each stop\n- NEVER reuse frame IDs from previous stops\n\nEXAMPLE PATTERN:\n  // Stop 1: Hit breakpoint — inspect variables\n  debugger_wait_for_stop()\n  debugger_get_variables({sessionId})  // auto-resolves frame, returns locals\n  \n  // Or if you need a specific frame:\n  stack = debugger_stack_trace()\n  debugger_get_variables({sessionId, frameId: stack.stackFrames[1].id})  // caller frame\n\nWORKFLOW:\n1. Session must be in 'Stopped' state (e.g., at a breakpoint)\n2. Call this tool to get current stack frames\n3. Use frame IDs with debugger_get_variables (to inspect variables) or debugger_evaluate (for expressions)\n4. Repeat after each new stop event\n\nTIMING: Returns in 10-50ms depending on stack depth\n\nTIP: The first frame (index 0) is the current execution point. Higher indices are caller frames.\n\nCOMMON USE CASES:\n- Get frame IDs for debugger_get_variables or debugger_evaluate\n- Inspect where a breakpoint was hit\n- Understand call hierarchy\n- Diagnose unexpected execution paths\n\nSEE ALSO: debugger_get_variables (preferred for variable inspection), debugger_evaluate (for expressions only)",
+                "description": "Returns the call stack while stopped. Use each frame's `id` with debugger_get_variables or debugger_evaluate. Frame IDs are only valid for the current stop; fetch a fresh trace after every resume/step.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1664,7 +1799,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_evaluate",
                 "title": "Evaluate Expression",
-                "description": "WARNING: Do NOT use this to read variable values — use debugger_get_variables instead.\nThis tool is for EXPRESSIONS only: arithmetic (x + y), comparisons (x > 10), function calls\n(len(arr)), type casts. Evaluating container variable names (Vec, HashMap, String) triggers\nthe expression compiler, which can consume GBs of memory and crash the debug session.\n\nEvaluates an expression in the context of the paused program. Can call functions and perform computations using the program's current state.\n\n⚠️ CRITICAL: frameId Requirement\n================================\nWhile technically optional, frameId is REQUIRED in practice for accessing local variables:\n\n❌ WITHOUT frameId:\n  debugger_evaluate({expression: \"local_var\"})\n  → Result: NameError: name 'local_var' is not defined\n  \n  Why: Evaluates in global/default context where local variables don't exist\n\n✅ WITH frameId (REQUIRED WORKFLOW):\n  1. Get stack trace: stack = debugger_stack_trace()\n  2. Extract frame ID: frameId = stack.stackFrames[0].id\n  3. Evaluate with frameId:\n     debugger_evaluate({expression: \"local_var\", frameId: frameId})\n  → Result: Successfully accesses local variable ✓\n\n⚠️ Frame IDs Change Between Stops!\n  - Frame IDs are NOT stable across different stop events\n  - ALWAYS get a fresh stack trace after each stop\n  - NEVER reuse frame IDs from previous stops\n\nEXAMPLE PATTERN (Correct Way):\n  // After hitting breakpoint:\n  const stack = debugger_stack_trace()\n  const frameId = stack.stackFrames[0].id  // Current frame\n  const value = debugger_evaluate({expression: \"n\", frameId: frameId})\n  \n  // After next stop, get NEW frame ID:\n  const stack2 = debugger_stack_trace()  // Fresh trace!\n  const frameId2 = stack2.stackFrames[0].id  // New frame ID\n  const value2 = debugger_evaluate({expression: \"n\", frameId: frameId2})\n\nWORKFLOW:\n1. Session must be in 'Stopped' state\n2. Call debugger_stack_trace to get current stack frames\n3. Extract frame ID from desired frame (usually frame[0] for current location)\n4. Call this tool with expression AND frameId\n5. Examine the result value\n\nTIMING: Returns in 20-200ms depending on expression complexity\n\nEXPRESSION EXAMPLES:\n- Variable access: \"x\", \"obj.property\", \"array[0]\"\n- Arithmetic: \"x + y\", \"count * 2\"\n- Comparisons: \"x > 10\", \"status == 'ready'\"\n- Function calls: \"len(array)\", \"obj.method()\"\n- Complex: \"[item for item in list if item > 0]\" (Python)\n\nRETURNS: {\"result\": \"string representation of evaluation result\"}\n\nCOMMON ERROR:\n  \"NameError: name 'variable' is not defined\"\n  → Solution: Add frameId parameter from debugger_stack_trace\n\nSEE ALSO: debugger_stack_trace (get frame IDs), debugger://patterns (cookbook examples)",
+                "description": "Evaluates an expression (arithmetic, comparisons, function calls) in a stack frame. Do NOT use to read bare container variables — the expression compiler can consume GBs of memory on large Vec/HashMap/String; use debugger_get_variables instead. `frameId` is required in practice to access locals.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1682,8 +1817,12 @@ impl ToolsHandler {
                         },
                         "context": {
                             "type": "string",
-                            "description": "Evaluation context: 'watch' (default, expression evaluation), 'repl' (raw debugger command, e.g. LLDB's 'frame variable x' or 'v x'), 'hover', or 'variables' (read locals via debug info, bypasses expression parser — useful when variable names collide with language keywords)",
+                            "description": "Evaluation context: 'watch' (default, expression evaluation), 'repl' (raw debugger command, e.g. LLDB's 'frame variable x' or 'v x'; LLDB stdout is captured into the response's `output` field, stderr into `stderr`), 'hover', or 'variables' (read locals via debug info, bypasses expression parser — useful when variable names collide with language keywords)",
                             "enum": ["watch", "repl", "hover", "variables"]
+                        },
+                        "noSynthetic": {
+                            "type": "boolean",
+                            "description": "Disable synthetic-children for this evaluate (CodeLLDB convention: prepends `?` and sets `format.showRaw=true`). Lets a scalar field path like `state.c.length` read the raw `usize` field on a BTreeMap without the expression compiler walking the surrounding synthetic view first. Use this whenever the expression resolves to a scalar through a container."
                         }
                     },
                     "required": ["sessionId", "expression"]
@@ -1700,7 +1839,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_get_variables",
                 "title": "Get Variables (Safe Inspection)",
-                "description": "PREFERRED way to inspect variables. Reads directly from debug info (DWARF) — no expression compilation, no memory explosion, safe for any container size.\n\nWARNING: Do NOT use debugger_evaluate to read variable values. Use this tool instead.\ndebuger_evaluate triggers the expression compiler (JIT) which can consume GBs of memory\nfor large containers (Vec, HashMap). This tool reads directly from memory and is safe.\n\nUse debugger_evaluate ONLY for expressions: arithmetic (x + y), comparisons (x > 10),\nfunction calls (len(arr)). Never for bare variable names.\n\nTWO MODES:\n1. Scope locals (frameId): Get all local variables in the current frame\n   debugger_get_variables({sessionId})  // auto-resolves frame\n   debugger_get_variables({sessionId, frameId: 1001})\n   debugger_get_variables({sessionId, scope: \"Globals\"})\n\n2. Drill-down (variablesReference): Expand a specific variable's children\n   debugger_get_variables({sessionId, variablesReference: 42, maxCount: 10})\n\nWORKFLOW:\n  // 1. Get locals\n  vars = debugger_get_variables({sessionId})\n  // vars.variables: [{name: \"big_vec\", value: \"size=10000\", expandable: true, variablesReference: 42}, ...]\n\n  // 2. Drill into expandable variable\n  children = debugger_get_variables({sessionId, variablesReference: 42, maxCount: 10})\n  // children.variables: [{name: \"[0]\", value: \"0\", ...}, ...]\n\nFILTERING:\n  filter: \"indexed\" — array elements only (e.g., Vec, array indices)\n  filter: \"named\" — struct fields / properties only (e.g., HashMap internals)\n\nRETURNS:\n  { variables: [...], count: N, truncated: bool, hint?: \"...\" }\n  Each variable: { name, value, type, variablesReference, expandable }\n  expandable=true means you can drill deeper with variablesReference.\n  truncated=true means there are more items (increase maxCount or paginate).\n\nNOTE: variablesReference values are only valid while the program is stopped at the\ncurrent location. After continue/step, get fresh variables.\n\nTIMING: 10-100ms",
+                "description": "Reads variables directly from debug info — safe for any container size, unlike debugger_evaluate. Returns locals when given `frameId` (or auto-resolves the current frame); drill into children via `variablesReference` from a prior result. Valid only while stopped at the current location.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1728,6 +1867,10 @@ impl ToolsHandler {
                             "type": "string",
                             "description": "Filter: 'indexed' for array elements, 'named' for struct fields. Omit for all.",
                             "enum": ["indexed", "named"]
+                        },
+                        "noSynthetic": {
+                            "type": "boolean",
+                            "description": "Bypass synthetic-children providers (CodeLLDB extension `format.showRaw`). Use this when drilling into a large container (Vec/HashMap/BTreeMap/BTreeSet) just to read scalar fields like `length` or `len` — synthetic providers materialise per-element children eagerly and can push RSS over a GB on big collections. Defaults to false (normal pretty view)."
                         }
                     },
                     "required": ["sessionId"]
@@ -1744,7 +1887,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_disconnect",
                 "title": "Disconnect Session",
-                "description": "Terminates a debugging session and cleans up all associated resources. The debugged program will be stopped if still running.\n\nWORKFLOW:\n1. Call this when debugging is complete\n2. Session and all breakpoints are removed\n3. Debugged program is terminated gracefully\n\nTIMING: Returns in 50-200ms (includes cleanup time)\n\nIMPORTANT: Always disconnect when finished to free resources. The session cannot be resumed after disconnection.\n\nRETURNS: {\"status\": \"disconnected\"}\n\nTIP: If the program is still running, it will be terminated. If you want to let the program finish naturally, you can skip calling this tool, but resources will not be cleaned up immediately.\n\nSEE ALSO: debugger://workflows (complete debugging workflows showing disconnect)",
+                "description": "Terminates the debug session and frees its resources. The debugged program is stopped if still running.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1767,7 +1910,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_wait_for_stop",
                 "title": "Wait For Program To Stop",
-                "description": "Blocks until the debugger stops (at breakpoint, step, or entry point), or times out. More efficient than polling debugger_session_state.\n\n⭐ EFFICIENT ALTERNATIVE TO POLLING\n==================================\nReplaces old pattern of repeated sleep + state check with single blocking call:\n\n❌ OLD PATTERN (slow, inefficient):\n  debugger_continue()\n  sleep(200ms)  // Arbitrary delay\n  state = debugger_session_state()\n  if state != \"Stopped\":\n    sleep(500ms)  // More waiting\n    state = debugger_session_state()  // Still might be Running\n  // Takes 500-3000ms with multiple polls\n\n✅ NEW PATTERN (fast, efficient):\n  debugger_continue()\n  debugger_wait_for_stop({timeoutMs: 5000})\n  // Returns immediately when stopped (typically <100ms)\n  // No wasted polling cycles!\n\n⭐ TIMING BEHAVIOR\n=================\n- If ALREADY stopped: Returns immediately (<10ms)\n- If running: Blocks until stop event or timeout\n- If program terminated: Returns with state \"Terminated\"\n- If timeout expires: Returns error\n\nTypical return times:\n- Entry point (stopOnEntry): <100ms\n- Breakpoint hit: <100ms  \n- Step completion: <50ms\n\nCOMMON PATTERNS:\n\n1. Wait for entry after start:\n   debugger_start({stopOnEntry: true})\n   debugger_wait_for_stop()  // Immediate return when at entry\n\n2. Wait for breakpoint:\n   debugger_continue()\n   debugger_wait_for_stop()  // Blocks until breakpoint hit\n\n3. Wait for step completion:\n   debugger_step_over()\n   debugger_wait_for_stop()  // Blocks until step completes\n\n4. Loop through multiple stops:\n   for (i = 0; i < 5; i++):\n     debugger_continue()\n     result = debugger_wait_for_stop()\n     // Process each stop...\n\nWORKFLOW:\n1. Call debugger_continue(), debugger_step_*, or debugger_start()\n2. Call this tool to wait for the next stop event\n3. Returns immediately when program stops\n4. Check result.reason to understand why it stopped\n\nRETURNS:\n{\n  \"state\": \"Stopped\",\n  \"threadId\": 1,\n  \"reason\": \"breakpoint\"  // or \"entry\", \"step\", \"pause\", etc.\n}\n\nPERFORMANCE:\n~5x faster than polling approach\nNo wasted CPU cycles\nImmediate notification of state changes\n\nSEE ALSO: debugger_session_state (check current state), debugger_continue (resume execution)",
+                "description": "Blocks until the session stops (breakpoint, step, entry, pause), terminates, or `timeoutMs` elapses. Returns `{state, threadId, reason}` plus enriched context. More efficient than polling debugger_session_state.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1787,7 +1930,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_list_breakpoints",
                 "title": "List All Breakpoints",
-                "description": "Lists all breakpoints currently set across all source files.\n\nUSEFUL FOR:\n- Verifying which breakpoints are active\n- Checking breakpoint verification status\n- Debugging why a breakpoint might not be hit\n\nTIMING: Returns immediately (<10ms)\n\nRETURNS: Array of breakpoints with id, verified status, line, and sourcePath",
+                "description": "Lists all breakpoints in the session with their verification status (id, verified, sourcePath, line).",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1802,7 +1945,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_remove_breakpoint",
                 "title": "Remove Breakpoint",
-                "description": "Removes a breakpoint at the specified source file and line number.\n\nWORKFLOW:\n1. Use debugger_list_breakpoints to see current breakpoints\n2. Call this tool with the sourcePath and line to remove\n3. The breakpoint is immediately removed from the debug session\n\nTIMING: Returns quickly (<50ms)\n\nRETURNS: Confirmation with the sourcePath and line that was removed",
+                "description": "Removes the breakpoint at the given `sourcePath:line`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1825,7 +1968,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_step_over",
                 "title": "Step Over (Next Line)",
-                "description": "Executes the current line and stops at the next line. Does NOT step into function calls.\n\n⭐ AUTO-ENRICHED: Returns full context automatically (no separate wait/inspect needed):\n- Stack trace with frame IDs\n- Local variables for current frame\n- Source code context (±5 lines)\n\nREQUIRES: Program must be stopped\n\nSEE ALSO: debugger_step_into (enter functions), debugger_step_out (exit function), debugger_trace_function (step through entire function)",
+                "description": "Executes the current line, stopping at the next line without entering function calls. Returns enriched context (stack, variables, source). Requires stopped state.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1844,7 +1987,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_step_into",
                 "title": "Step Into (Enter Function)",
-                "description": "Steps into function calls on the current line. If no function call, behaves like step_over.\n\n⭐ AUTO-ENRICHED: Returns full context automatically (stack trace, variables, source).\n\nREQUIRES: Program must be stopped\n\nSEE ALSO: debugger_step_over (skip functions), debugger_step_out (exit function)",
+                "description": "Steps into the function called on the current line, otherwise behaves like step_over. Returns enriched context. Requires stopped state.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1863,7 +2006,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_step_out",
                 "title": "Step Out (Exit Function)",
-                "description": "Continues execution until the current function returns, then stops at the caller.\n\n⭐ AUTO-ENRICHED: Returns full context automatically (stack trace, variables, source).\n\nREQUIRES: Program must be stopped inside a function\n\nSEE ALSO: debugger_step_into (enter function), debugger_step_over (next line)",
+                "description": "Resumes until the current function returns, then stops at the caller. Returns enriched context. Requires stopped state inside a function.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1882,7 +2025,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_get_output",
                 "title": "Get Program Output",
-                "description": "Retrieves stdout/stderr output from the debugged program. Output is buffered in a ring buffer (last 1000 entries). Use parameters to filter by category, search for text, or paginate with sinceLine.\n\nWORKFLOW:\n1. Start a debug session with debugger_start\n2. Let the program run (continue, step, etc.)\n3. Call this tool to see what the program printed\n\nCATEGORIES:\n- stdout: Standard output from the program\n- stderr: Standard error output\n- console: Debug adapter console messages\n- all: All categories (default)\n\nPAGINATION: Use sinceLine with the line_number from the last entry to get subsequent output.\n\nSEE ALSO: debugger://sessions/{id}/output (resource for quick snapshot)",
+                "description": "Returns buffered stdout/stderr from the debugged program (ring buffer, last 1000 entries). Filter by `category`, `search` text, or paginate with `sinceLine`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1914,7 +2057,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_run_to_crash",
                 "title": "Run Program Until It Crashes",
-                "description": "⭐ RECOMMENDED for bug investigation. Launches a program with exception breakpoints, runs until it crashes, and returns full crash context in a single call.\n\nRETURNS (on crash): Stack trace, local variables, source context, exception info, session ID\nRETURNS (clean exit): Terminated state with program output\n\nEQUIVALENT TO (but in 1 call instead of 5+):\n  debugger_start() → wait → set_exception_breakpoints → continue → wait → stack_trace → evaluate\n\nSEE ALSO: debugger_snapshot_at (inspect state at specific line), debugger_start (manual control)",
+                "description": "Launches a program with exception breakpoints and runs until it crashes or exits. On crash returns stack, locals, source context, and exception info in a single call; on clean exit returns Terminated state with program output.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1955,7 +2098,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_snapshot_at",
                 "title": "Capture State at Line",
-                "description": "Sets a temporary breakpoint, runs to it, captures full debug context + evaluates expressions, then removes the breakpoint. Single-call state inspection.\n\nRETURNS: Stack trace, local variables, source context, evaluated expressions, session ID\n\nEQUIVALENT TO (but in 1 call instead of 6+):\n  set_breakpoint → continue → wait → stack_trace → evaluate × N → remove_breakpoint\n\nSEE ALSO: debugger_run_to_crash (crash investigation), debugger_trace_function (step through function)",
+                "description": "Sets a temporary breakpoint, runs to it, captures stack/locals/source plus any evaluated `expressions`, then removes the breakpoint.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1983,7 +2126,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_trace_function",
                 "title": "Trace Function Execution",
-                "description": "Steps through the current function line by line, recording execution trace with expression values at each step. Stops when the function returns or max steps reached.\n\nREQUIRES: Program must be stopped at or inside the target function.\n\nRETURNS: Array of trace entries, each with line number, source text, and expression values.\n\nUSEFUL FOR: Understanding control flow, watching how variables change through a function.\n\nSEE ALSO: debugger_step_over (single step), debugger_snapshot_at (capture at one point)",
+                "description": "Steps through the current function line by line, recording each line with the values of `expressions`. Stops when the function returns or `maxSteps` is reached. Requires stopped state inside the target function.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2007,7 +2150,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_debugging_tips",
                 "title": "Debugging Tips & Known Issues",
-                "description": "Returns language-specific debugging tips, known issues, and workarounds.\nCall this ONCE at the start of a debugging session to learn about limitations and\nbest practices for the language's debug adapter.\nNo session required — works before debugger_start.",
+                "description": "Returns language-specific debugger tips, known issues, and workarounds. No session required.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -2028,7 +2171,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_set_data_breakpoint",
                 "title": "Set Data Breakpoint (Watchpoint)",
-                "description": "Sets a data breakpoint (watchpoint) that triggers when a variable's memory is written to, read from, or both.\n\nRequires hardware support. Limitations:\n- Max 4 data breakpoints simultaneously (x86_64 hardware limit)\n- Monitored region must be 1, 2, 4, or 8 bytes\n- Not all adapters support this (check adapter capabilities)\n\nThe program must be stopped. The tool first queries if the variable supports data breakpoints, then sets the watchpoint.",
+                "description": "Sets a data breakpoint (watchpoint) that fires on read, write, or readWrite of a variable. Requires hardware support (max ~4 simultaneously on x86_64, 1/2/4/8-byte regions) and stopped state.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

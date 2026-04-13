@@ -319,7 +319,10 @@ impl SessionManager {
                     adapter.log_selection();
 
                     // Detect project type and decide compilation strategy
-                    let use_cargo_integration = if program.ends_with(".rs") {
+                    // Accept Cargo.toml directly or .rs files inside a Cargo project
+                    let use_cargo_integration = if program.ends_with("Cargo.toml") {
+                        true
+                    } else if program.ends_with(".rs") {
                         matches!(
                             RustAdapter::detect_project_type(&program),
                             Ok(crate::adapters::rust::RustProjectType::CargoProject { .. })
@@ -330,13 +333,24 @@ impl SessionManager {
 
                     let (binary_path, launch_args) = if use_cargo_integration {
                         // Cargo project: let CodeLLDB handle compilation via its cargo integration
-                        let cargo_root = match RustAdapter::detect_project_type(&program)? {
-                            crate::adapters::rust::RustProjectType::CargoProject { root, .. } => {
-                                root.to_str()
-                                    .ok_or_else(|| Error::Process("Non-UTF8 Cargo root path".to_string()))?
-                                    .to_string()
+                        let cargo_root = if program.ends_with("Cargo.toml") {
+                            // Cargo.toml passed directly — use its parent directory
+                            std::path::Path::new(&program)
+                                .parent()
+                                .ok_or_else(|| Error::Process("Cargo.toml has no parent directory".to_string()))?
+                                .to_str()
+                                .ok_or_else(|| Error::Process("Non-UTF8 Cargo root path".to_string()))?
+                                .to_string()
+                        } else {
+                            // .rs file inside a Cargo project — detect the root
+                            match RustAdapter::detect_project_type(&program)? {
+                                crate::adapters::rust::RustProjectType::CargoProject { root, .. } => {
+                                    root.to_str()
+                                        .ok_or_else(|| Error::Process("Non-UTF8 Cargo root path".to_string()))?
+                                        .to_string()
+                                }
+                                _ => unreachable!(),
                             }
-                            _ => unreachable!(),
                         };
                         info!("📦 [RUST] Using CodeLLDB Cargo integration for: {}", cargo_root);
 

@@ -156,6 +156,23 @@ pub struct Thread {
     pub name: String,
 }
 
+/// CodeLLDB-extended ValueFormat. The DAP spec defines `hex: bool`; CodeLLDB
+/// adds `showRaw` which when true skips synthetic children providers and
+/// exposes the underlying struct fields. For large containers (Vec, HashMap,
+/// BTreeMap, BTreeSet) this is dramatically cheaper because the synthetic
+/// provider doesn't have to materialise per-element children before answering.
+///
+/// Both fields are optional; serializing an all-None ValueFormat is harmless
+/// — DAP-spec adapters will just ignore unrecognised fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ValueFormat {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hex: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub show_raw: Option<bool>,
+}
+
 /// Evaluate Request Arguments
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +180,8 @@ pub struct EvaluateArguments {
     pub expression: String,
     pub frame_id: Option<i32>,
     pub context: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ValueFormat>,
 }
 
 /// Variable
@@ -200,6 +219,8 @@ pub struct VariablesArguments {
     pub filter: Option<String>,
     pub start: Option<i32>,
     pub count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<ValueFormat>,
 }
 
 /// Continue Request Arguments

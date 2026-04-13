@@ -1468,22 +1468,46 @@ impl DapClient {
     /// This prevents CodeLLDB/LLDB from materializing huge collections (Vec with 100k elements)
     /// which can cause multi-GB memory usage.
     /// `filter`: "indexed" for array elements, "named" for struct fields, None for all.
-    pub async fn variables_limited(&self, variables_reference: i32, max_count: Option<i32>, filter: Option<&str>) -> Result<Vec<Variable>> {
+    /// `no_synthetic`: when true, sets `format.showRaw=true` (CodeLLDB extension) so the
+    /// adapter exposes raw struct fields instead of synthetic children. Cheap path for
+    /// reading length/scalar fields off large containers without materialising elements.
+    pub async fn variables_limited(
+        &self,
+        variables_reference: i32,
+        max_count: Option<i32>,
+        filter: Option<&str>,
+        no_synthetic: bool,
+    ) -> Result<Vec<Variable>> {
         let args = VariablesArguments {
             variables_reference,
             filter: filter.map(|s| s.to_string()),
             start: Some(0),
             count: max_count,
+            format: if no_synthetic {
+                Some(crate::dap::types::ValueFormat {
+                    show_raw: Some(true),
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
         };
 
-        let timeout = std::time::Duration::from_secs(10);
+        // 4s — chosen so the request is cancelled before the supervisor (which
+        // polls every 500ms with a low RSS limit in tests) has time to kill
+        // the adapter. CodeLLDB can still allocate during this window, but the
+        // DAP cancel triggered on timeout (see send_request_with_timeout)
+        // unwinds the synthetic provider before it exhausts memory in most
+        // cases. If you genuinely need to wait longer, raise the limit
+        // explicitly via session config — don't widen this default.
+        let timeout = std::time::Duration::from_secs(4);
         let response = self
             .send_request_with_timeout("variables", Some(serde_json::to_value(args)?), timeout)
             .await
             .map_err(|e| Error::Dap(format!(
                 "variables request timed out after {timeout:?} (variablesReference={variables_reference}). \
                  This often happens with large or deeply nested types (e.g. HashMap, Vec with many elements). \
-                 Try evaluating a specific field instead of the whole variable. \
+                 Pass `noSynthetic: true` to bypass synthetic providers, or evaluate a specific field instead. \
                  Original error: {e}"
             )))?;
 
@@ -1517,6 +1541,7 @@ impl DapClient {
             filter: None,
             start: None,
             count: None,
+            format: None,
         };
 
         let timeout = std::time::Duration::from_secs(10);
@@ -1696,13 +1721,38 @@ impl DapClient {
             }
         };
 
-        let args = EvaluateArguments {
-            expression: expression.to_string(),
-            frame_id,
-            context: Some(context.unwrap_or_else(|| "watch".to_string())),
+        // CodeLLDB convention: a leading `?` on the expression disables synthetic
+        // children for the eval. Strip it from the wire expression and route it
+        // through `format.showRaw` instead — same effect, but works on adapters
+        // that don't recognise the prefix and on DAP-spec consumers that
+        // reflect arguments back to the user.
+        let (wire_expression, no_synthetic) = match expression.strip_prefix('?') {
+            Some(rest) => (rest.to_string(), true),
+            None => (expression.to_string(), false),
         };
 
-        let timeout = std::time::Duration::from_secs(15);
+        let args = EvaluateArguments {
+            expression: wire_expression,
+            frame_id,
+            context: Some(context.unwrap_or_else(|| "watch".to_string())),
+            format: if no_synthetic {
+                Some(crate::dap::types::ValueFormat {
+                    show_raw: Some(true),
+                    ..Default::default()
+                })
+            } else {
+                None
+            },
+        };
+
+        // 8s for evaluate — tighter than the previous 15s default. The user-
+        // reported "scalar field path explodes" failure consumed the full 15s
+        // before erroring; halving the budget gets the caller a structured
+        // error and a recommendation faster, without blocking long enough for
+        // CodeLLDB to chew through 4 GB. If the underlying expression is
+        // genuinely slow (Python eval, expensive method call), the caller
+        // should split the work — not extend this timeout.
+        let timeout = std::time::Duration::from_secs(8);
         let response = self
             .send_request_with_timeout("evaluate", Some(serde_json::to_value(args)?), timeout)
             .await
@@ -1711,7 +1761,8 @@ impl DapClient {
                  This can happen when: (1) the expression triggers expensive computation in the debugger, \
                  (2) the type is large/deeply nested (e.g. HashMap, Vec with many elements), or \
                  (3) the debug adapter is stuck. \
-                 Try: use context=\"repl\" with an LLDB command like 'frame variable <name>' for faster inspection, \
+                 Try: prefix the expression with `?` to disable synthetic children (CodeLLDB convention), \
+                 use context=\"repl\" with an LLDB command like 'frame variable <name>' for faster inspection, \
                  or evaluate a specific field (e.g. 'obj.field') instead of the whole object. \
                  Original error: {e}",
                 expression
@@ -1765,6 +1816,7 @@ impl DapClient {
                 variables_reference,
                 Some(Self::MAX_CHILDREN_PER_LEVEL),
                 None,
+                false,
             ).await?;
             if children.is_empty() {
                 return Ok(String::new());

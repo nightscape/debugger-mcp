@@ -28,6 +28,8 @@ assert_matches = "1.5.0"
 assert_cmd = "2.0"
 predicates = "3.1"
 sysinfo = "0.35"
+proptest = "1"
+proptest-state-machine = "0.8"
 
 [[test]]
 name = "fake_dap_adapter"
@@ -94,6 +96,43 @@ path = "tests/integration/lang/rust_model_test.rs"
 [[test]]
 name = "rust_proptest_test"
 path = "tests/integration/rust_proptest_test.rs"
+
+# Mini-Rust DSL: AST + interpreter + codegen smoke test (PBT reference scaffolding)
+[[test]]
+name = "mini_rust_smoke_test"
+path = "tests/integration/mini_rust_smoke_test.rs"
+
+# Mini-Rust DSL: full PBT driving CodeLLDB against generated programs
+[[test]]
+name = "mini_rust_pbt_test"
+path = "tests/integration/mini_rust_pbt_test.rs"
+
+# Mini-Rust DSL: pinned regression test for CodeLLDB child layout assumptions
+# the Map/Vec oracle relies on. Auto-skips when `codelldb` isn't on PATH.
+[[test]]
+name = "mini_rust_map_layout_probe"
+path = "tests/integration/mini_rust_map_layout_probe.rs"
+
+# Memory-pressure PBT — reproduces the LLDB synthetic-provider explosion when
+# get_variables/evaluate touches large containers. Currently expected to fail
+# against the unfixed adapter; runs `--ignored` so it stays out of default CI.
+[[test]]
+name = "mini_rust_memory_pbt_test"
+path = "tests/integration/mini_rust_memory_pbt_test.rs"
+
+# REPL passthrough — verifies `debugger_evaluate(context: "repl")` returns the
+# real LLDB stdout/stderr instead of an empty string. Reproduces the silent-
+# REPL failure mode reported in user feedback.
+[[test]]
+name = "repl_passthrough_test"
+path = "tests/integration/repl_passthrough_test.rs"
+
+# Line-tables-only DWARF — verifies the variables tool surfaces a clear hint
+# when locals were stripped by the build profile, instead of silently returning
+# []. Reproduces the misleading-error failure mode reported in user feedback.
+[[test]]
+name = "line_tables_only_test"
+path = "tests/integration/line_tables_only_test.rs"
 
 [[test]]
 name = "rust_init_test"

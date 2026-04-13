@@ -80,38 +80,18 @@ impl ProtocolHandler {
         self.resources_handler = Some(handler);
     }
 
-    pub async fn handle_message(&mut self, msg: JsonRpcMessage) -> JsonRpcMessage {
+    pub async fn handle_message(&mut self, msg: JsonRpcMessage) -> Option<JsonRpcMessage> {
         match msg {
             JsonRpcMessage::Request(req) => {
-                JsonRpcMessage::Response(self.handle_request(req).await)
+                Some(JsonRpcMessage::Response(self.handle_request(req).await))
             }
             JsonRpcMessage::Notification(notif) => {
                 self.handle_notification(notif).await;
-                // Notifications don't get responses, return a dummy response
-                // In practice, we'd need to handle this differently
-                JsonRpcMessage::Response(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32600,
-                        message: "Notifications not yet supported".to_string(),
-                        data: None,
-                    }),
-                })
+                None
             }
             JsonRpcMessage::Response(_) => {
                 warn!("Received response message, ignoring");
-                JsonRpcMessage::Response(JsonRpcResponse {
-                    jsonrpc: "2.0".to_string(),
-                    id: Value::Null,
-                    result: None,
-                    error: Some(JsonRpcError {
-                        code: -32600,
-                        message: "Server does not accept response messages".to_string(),
-                        data: None,
-                    }),
-                })
+                None
             }
         }
     }
@@ -534,17 +514,7 @@ mod tests {
         let response = handler
             .handle_message(JsonRpcMessage::Notification(notif))
             .await;
-        match response {
-            JsonRpcMessage::Response(r) => {
-                assert!(r.error.is_some());
-                assert!(r
-                    .error
-                    .unwrap()
-                    .message
-                    .contains("Notifications not yet supported"));
-            }
-            _ => panic!("Expected response"),
-        }
+        assert!(response.is_none());
     }
 
     #[tokio::test]
@@ -558,17 +528,7 @@ mod tests {
         };
 
         let response = handler.handle_message(JsonRpcMessage::Response(resp)).await;
-        match response {
-            JsonRpcMessage::Response(r) => {
-                assert!(r.error.is_some());
-                assert!(r
-                    .error
-                    .unwrap()
-                    .message
-                    .contains("Server does not accept response messages"));
-            }
-            _ => panic!("Expected response"),
-        }
+        assert!(response.is_none());
     }
 
     // Phase 6B: Additional protocol tests for uncovered lines
@@ -592,11 +552,11 @@ mod tests {
 
         let response = handler.handle_message(JsonRpcMessage::Request(req)).await;
         match response {
-            JsonRpcMessage::Response(r) => {
+            Some(JsonRpcMessage::Response(r)) => {
                 assert!(r.error.is_none());
                 assert!(r.result.is_some());
             }
-            _ => panic!("Expected response"),
+            other => panic!("Expected Some(Response), got {:?}", other),
         }
     }
 

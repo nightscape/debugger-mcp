@@ -1157,6 +1157,15 @@ impl DebugSession {
 
     pub async fn continue_execution(&self) -> Result<()> {
         let state = self.state.read().await;
+        if matches!(
+            state.state,
+            DebugState::Terminated | DebugState::Failed { .. } | DebugState::NotStarted
+        ) {
+            return Err(crate::Error::InvalidState(format!(
+                "Cannot continue in state: {:?}",
+                state.state
+            )));
+        }
         let thread_id = state.threads.first().copied().unwrap_or(1);
         drop(state);
 
@@ -1177,6 +1186,7 @@ impl DebugSession {
     }
 
     pub async fn step_over(&self, thread_id: i32) -> Result<()> {
+        self.guard_steppable("step_over").await?;
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
         client.cancel_pending_requests().await;
@@ -1192,6 +1202,7 @@ impl DebugSession {
     }
 
     pub async fn step_into(&self, thread_id: i32) -> Result<()> {
+        self.guard_steppable("step_into").await?;
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
         client.cancel_pending_requests().await;
@@ -1204,6 +1215,7 @@ impl DebugSession {
     }
 
     pub async fn step_out(&self, thread_id: i32) -> Result<()> {
+        self.guard_steppable("step_out").await?;
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
         client.cancel_pending_requests().await;
@@ -1211,6 +1223,20 @@ impl DebugSession {
 
         let mut state = self.state.write().await;
         state.set_state(DebugState::Running);
+        Ok(())
+    }
+
+    async fn guard_steppable(&self, op: &str) -> Result<()> {
+        let state = self.state.read().await;
+        if matches!(
+            state.state,
+            DebugState::Terminated | DebugState::Failed { .. } | DebugState::NotStarted
+        ) {
+            return Err(crate::Error::InvalidState(format!(
+                "Cannot {} in state: {:?}",
+                op, state.state
+            )));
+        }
         Ok(())
     }
 
@@ -1292,7 +1318,7 @@ impl DebugSession {
         };
 
         let max_count = max_count.min(200);
-        self.get_variable_children(scope.variables_reference, None, max_count).await
+        self.get_variable_children(scope.variables_reference, None, max_count, false).await
     }
 
     /// Fetch children of a variablesReference, with optional filter and count limit.
@@ -1302,6 +1328,7 @@ impl DebugSession {
         variables_reference: i32,
         filter: Option<&str>,
         max_count: i32,
+        no_synthetic: bool,
     ) -> Result<Vec<crate::dap::types::Variable>> {
         if variables_reference <= 0 {
             return Err(crate::Error::Dap(format!(
@@ -1316,7 +1343,7 @@ impl DebugSession {
         let timeout = std::time::Duration::from_secs(5);
         let variables = tokio::time::timeout(
             timeout,
-            client.variables_limited(variables_reference, Some(max_count), filter),
+            client.variables_limited(variables_reference, Some(max_count), filter, no_synthetic),
         )
         .await
         .map_err(|_| crate::Error::Dap("Timeout fetching variables".to_string()))??;
@@ -1344,7 +1371,19 @@ impl DebugSession {
         let timeout = std::time::Duration::from_secs(5);
         let variables = tokio::time::timeout(
             timeout,
-            client.variables_limited(scope.variables_reference, Some(30), None),
+            // Auto-enrichment runs on every stop. Even though we only ask for
+            // top-level locals (depth=0), CodeLLDB computes a "summary" string
+            // for each Variable's `value` field — and for a frame containing
+            // a struct with 5+ large container fields, that summary walks each
+            // container's synthetic provider, materialising children. The
+            // result: the supervisor kills the adapter on the first stop in a
+            // fat-state frame, before the user has a chance to ask for
+            // anything. Setting `no_synthetic=true` here tells CodeLLDB to use
+            // raw struct fields instead, skipping the per-element walk. The
+            // tradeoff: locals' `value` column shows raw struct shape rather
+            // than a pretty summary, but the names/types are unchanged and the
+            // user can still drill into any local explicitly.
+            client.variables_limited(scope.variables_reference, Some(30), None, true),
         )
         .await
         .map_err(|_| crate::Error::Dap("Timeout fetching local variables".to_string()))??;
@@ -1472,6 +1511,14 @@ impl DebugSession {
             .take(limit)
             .cloned()
             .collect()
+    }
+
+    /// Snapshot the current output line counter. Pass the returned value as
+    /// `since_line` to `get_output` to fetch only entries produced *after* the
+    /// snapshot — used by `debugger_evaluate(context: "repl")` to attribute
+    /// LLDB stdout/stderr to a specific REPL command.
+    pub fn current_output_line(&self) -> usize {
+        self.output_line_counter.load(Ordering::Relaxed)
     }
 }
 
