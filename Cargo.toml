@@ -134,6 +134,14 @@ path = "tests/integration/repl_passthrough_test.rs"
 name = "line_tables_only_test"
 path = "tests/integration/line_tables_only_test.rs"
 
+# Async state-machine OOM — reproduces failure mode #5: inspecting locals at an
+# `.await` suspension point can blow up LLDB because the compiler-generated
+# `{async_fn_env#N}` is a tagged union of all suspension variants. Pinned
+# `#[ignore]` regression guards + one living-document expected-fail.
+[[test]]
+name = "async_state_machine_pbt_test"
+path = "tests/integration/async_state_machine_pbt_test.rs"
+
 [[test]]
 name = "rust_init_test"
 path = "tests/integration/lang/rust_init_test.rs"

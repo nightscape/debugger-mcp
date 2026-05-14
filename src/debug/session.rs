@@ -67,10 +67,11 @@
 //! - `src/dap/client.rs` - DapClient with reverse request handling
 //! - `docs/NODEJS_ALL_TESTS_PASSING.md` - Multi-session architecture details
 
+use super::async_state::{extend_path, is_state_machine_type};
 use super::multi_session::MultiSessionManager;
 use super::state::{BreakpointLocation, DebugState, SessionState};
 use crate::dap::client::DapClient;
-use crate::dap::types::{Source, SourceBreakpoint};
+use crate::dap::types::{Source, SourceBreakpoint, Variable};
 use crate::Result;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -108,6 +109,20 @@ pub enum SessionMode {
     },
 }
 
+/// One entry in the variables-reference cache. Stores everything needed to
+/// (1) detect a drill into an async/coroutine state-machine type, and (2)
+/// reconstruct an expression usable by `evaluate` so we can route around
+/// the variables request when CodeLLDB's synthetic walk would OOM.
+#[derive(Debug, Clone)]
+pub(crate) struct VarCacheEntry {
+    /// DWARF type name as reported by the adapter. Used by
+    /// `is_state_machine_type` to detect rustc-emitted state-machine wrappers.
+    pub type_name: String,
+    /// Expression path from a frame-visible root, e.g. `state.c[0]`. Usable
+    /// directly as the `expression` argument to `evaluate`.
+    pub path: String,
+}
+
 pub struct DebugSession {
     pub id: String,
     pub language: String,
@@ -125,6 +140,13 @@ pub struct DebugSession {
     /// Last tool call description, used by the supervisor to craft
     /// context-aware error messages when the adapter is killed.
     pub(crate) last_tool_context: Arc<RwLock<Option<String>>>,
+    /// Per-session cache of DAP `variables_reference` → (type, expression
+    /// path). Populated as a side effect of every `variables` response.
+    /// Used to detect drills into async state-machine types and route
+    /// them through `evaluate("?path")` (the only path CodeLLDB honors
+    /// for disabling synthetic providers). Cleared on every state
+    /// transition that invalidates var_refs (Running/Terminated/Failed).
+    pub(crate) variable_cache: Arc<RwLock<HashMap<i32, VarCacheEntry>>>,
 }
 
 impl DebugSession {
@@ -148,6 +170,7 @@ impl DebugSession {
             output_line_counter: Arc::new(AtomicUsize::new(0)),
             adapter_pid: None,
             last_tool_context: Arc::new(RwLock::new(None)),
+            variable_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -172,6 +195,7 @@ impl DebugSession {
             output_line_counter: Arc::new(AtomicUsize::new(0)),
             adapter_pid: None,
             last_tool_context: Arc::new(RwLock::new(None)),
+            variable_cache: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -1181,6 +1205,8 @@ impl DebugSession {
 
         let mut state = self.state.write().await;
         state.set_state(DebugState::Running);
+        drop(state);
+        self.invalidate_variable_cache().await;
 
         Ok(())
     }
@@ -1197,6 +1223,8 @@ impl DebugSession {
         // completes.
         let mut state = self.state.write().await;
         state.set_state(DebugState::Running);
+        drop(state);
+        self.invalidate_variable_cache().await;
 
         Ok(())
     }
@@ -1210,6 +1238,8 @@ impl DebugSession {
 
         let mut state = self.state.write().await;
         state.set_state(DebugState::Running);
+        drop(state);
+        self.invalidate_variable_cache().await;
 
         Ok(())
     }
@@ -1223,6 +1253,8 @@ impl DebugSession {
 
         let mut state = self.state.write().await;
         state.set_state(DebugState::Running);
+        drop(state);
+        self.invalidate_variable_cache().await;
         Ok(())
     }
 
@@ -1323,13 +1355,22 @@ impl DebugSession {
 
     /// Fetch children of a variablesReference, with optional filter and count limit.
     /// `filter`: "indexed" for array elements, "named" for struct fields, None for all.
+    ///
+    /// Type-aware behavior: if the cache says this var_ref points at an
+    /// async/coroutine state-machine type, the drill is routed through
+    /// `evaluate("?path")` instead of a direct `variables` request — CodeLLDB
+    /// honors `?` (showRaw) on evaluate but not on variables as of 1.11, and
+    /// the synthetic walk on a state-machine union can OOM the adapter
+    /// (see `tests/integration/async_state_machine_pbt_test.rs`). The caller's
+    /// `no_synthetic` flag still wins if explicitly set — this only catches
+    /// cases where the caller didn't know to set it.
     pub async fn get_variable_children(
         &self,
         variables_reference: i32,
         filter: Option<&str>,
         max_count: i32,
         no_synthetic: bool,
-    ) -> Result<Vec<crate::dap::types::Variable>> {
+    ) -> Result<Vec<Variable>> {
         if variables_reference <= 0 {
             return Err(crate::Error::Dap(format!(
                 "Invalid variablesReference: {}. Must be > 0.", variables_reference
@@ -1337,6 +1378,49 @@ impl DebugSession {
         }
         let max_count = max_count.min(200);
 
+        // Cache lookup: do we know this is a state-machine type? If so,
+        // route the drill through evaluate("?path") which CodeLLDB honors.
+        let cache_entry = self.variable_cache.read().await.get(&variables_reference).cloned();
+        if !no_synthetic {
+            if let Some(entry) = &cache_entry {
+                if is_state_machine_type(&entry.type_name) {
+                    info!(
+                        "🔁 routing drill on var_ref={} through evaluate(\"?{}\") \
+                         (type={}, would otherwise OOM on synthetic walk)",
+                        variables_reference, entry.path, entry.type_name,
+                    );
+                    return self.fetch_children_via_evaluate(
+                        variables_reference,
+                        entry.path.clone(),
+                        filter,
+                        max_count,
+                    ).await;
+                }
+            }
+        }
+
+        // Normal path. Populate cache from the response so future drills
+        // on the children we return can also detect state-machine types.
+        let parent_path = cache_entry.as_ref().map(|e| e.path.clone());
+        self.fetch_children_and_cache(
+            variables_reference,
+            parent_path,
+            filter,
+            max_count,
+            no_synthetic,
+        ).await
+    }
+
+    /// Internal: issue a `variables_limited` and update the var_ref cache
+    /// from the response.
+    async fn fetch_children_and_cache(
+        &self,
+        variables_reference: i32,
+        parent_path: Option<String>,
+        filter: Option<&str>,
+        max_count: i32,
+        no_synthetic: bool,
+    ) -> Result<Vec<Variable>> {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
 
@@ -1349,12 +1433,117 @@ impl DebugSession {
         .map_err(|_| crate::Error::Dap("Timeout fetching variables".to_string()))??;
 
         // Client-side truncation: CodeLLDB ignores the count parameter.
-        Ok(variables.into_iter().take(max_count as usize).collect())
+        let variables: Vec<Variable> =
+            variables.into_iter().take(max_count as usize).collect();
+
+        // Populate the var_ref cache. Children with var_ref > 0 are the
+        // only entries that can be drilled into; only those need caching.
+        //
+        // Skip cache entries whose name is empty or LLDB-internal — those
+        // are synthetic siblings (active-variant summary, `[raw]`, etc.)
+        // with no source-level identifier we can plug into `evaluate`.
+        // Caching them with an empty path would silently route drills
+        // through evaluate("?") which always fails.
+        if !variables.is_empty() {
+            let mut cache = self.variable_cache.write().await;
+            for v in &variables {
+                if v.variables_reference > 0 && !v.name.is_empty() && v.name != "[raw]" {
+                    let path = match &parent_path {
+                        Some(p) => extend_path(p, &v.name),
+                        None => extend_path("", &v.name),
+                    };
+                    cache.insert(v.variables_reference, VarCacheEntry {
+                        type_name: v.type_.clone().unwrap_or_default(),
+                        path,
+                    });
+                }
+            }
+        }
+
+        Ok(variables)
+    }
+
+    /// Internal: route a drill through `evaluate("?path", context: "watch")`
+    /// to bypass CodeLLDB's synthetic walk. Used when the cache identifies
+    /// the drill target as a state-machine type. Re-wraps the evaluate
+    /// response's children as if they came from a `variables` request and
+    /// re-populates the cache so further drills on those children also work.
+    ///
+    /// Falls back to a `no_synthetic=true` variables request on the original
+    /// var_ref if evaluate can't resolve the path — happens for paths that
+    /// are valid at-cache-write time but stop being addressable at drill time
+    /// (e.g. a captured local that's been moved by codegen, or an LLDB
+    /// synthetic with a name that looks like an identifier but isn't one).
+    async fn fetch_children_via_evaluate(
+        &self,
+        original_var_ref: i32,
+        path: String,
+        filter: Option<&str>,
+        max_count: i32,
+    ) -> Result<Vec<Variable>> {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        let expr = format!("?{path}");
+
+        let eval_result = client
+            .evaluate_raw(&expr, None, Some("watch".to_string()))
+            .await;
+        drop(client);
+
+        match eval_result {
+            Ok((_, raw_view_ref)) if raw_view_ref > 0 => {
+                // Drill into the raw view returned by evaluate. We synthesize
+                // a parent_path matching the evaluate expression — that lets
+                // nested drills keep routing through evaluate if they hit
+                // another state-machine type.
+                self.fetch_children_and_cache(
+                    raw_view_ref,
+                    Some(path),
+                    filter,
+                    max_count,
+                    true, // already in raw view; keep synthetic off for safety
+                ).await
+            }
+            Ok((_, _)) => {
+                // Expression resolved to a scalar with no children. Caller
+                // asked for "children of X"; if X has none, return empty.
+                Ok(Vec::new())
+            }
+            Err(e) => {
+                // evaluate couldn't address this path. Fall back to a direct
+                // variables request with no_synthetic=true. On CodeLLDB 1.11
+                // and earlier the flag is a no-op on the variables request,
+                // so this may still hit the synthetic walk — but it's the
+                // best we can do without losing the call entirely.
+                warn!(
+                    "evaluate('?{path}') failed ({e}); falling back to \
+                     variables(no_synthetic=true) on var_ref={original_var_ref}"
+                );
+                self.fetch_children_and_cache(
+                    original_var_ref,
+                    Some(path),
+                    filter,
+                    max_count,
+                    true,
+                ).await
+            }
+        }
+    }
+
+    /// Clear the var_ref cache. Called on every state transition that
+    /// invalidates DAP variables_references (continue, step, terminate,
+    /// fail) — the adapter reuses var_ref numbers across stops, so a
+    /// stale entry would be silently incorrect, not just useless.
+    pub(crate) async fn invalidate_variable_cache(&self) {
+        let mut cache = self.variable_cache.write().await;
+        if !cache.is_empty() {
+            cache.clear();
+        }
     }
 
     /// Fetch local variables with optional child expansion (used by stack trace enrichment).
     /// Delegates to get_scope_variables + expand_variable.
-    pub async fn get_local_variables(&self, frame_id: i32, expand_depth: u32) -> Result<Vec<crate::dap::types::Variable>> {
+    pub async fn get_local_variables(&self, frame_id: i32, expand_depth: u32) -> Result<Vec<Variable>> {
         let scopes = self.scopes(frame_id).await?;
 
         let scope = match scopes.into_iter().find(|s| !s.expensive) {
@@ -1365,28 +1554,34 @@ impl DebugSession {
             }
         };
 
+        // Auto-enrichment runs on every stop. Even though we only ask for
+        // top-level locals (depth=0), CodeLLDB computes a "summary" string
+        // for each Variable's `value` field — and for a frame containing
+        // a struct with 5+ large container fields, that summary walks each
+        // container's synthetic provider, materialising children. The
+        // result: the supervisor kills the adapter on the first stop in a
+        // fat-state frame, before the user has a chance to ask for
+        // anything. Setting `no_synthetic=true` here tells CodeLLDB to use
+        // raw struct fields instead, skipping the per-element walk. The
+        // tradeoff: locals' `value` column shows raw struct shape rather
+        // than a pretty summary, but the names/types are unchanged and the
+        // user can still drill into any local explicitly.
+        //
+        // Routing through fetch_children_and_cache (rather than calling
+        // variables_limited directly) populates the var_ref cache from this
+        // first scope expansion — without that, the type-aware drill logic
+        // in get_variable_children has nothing to look up when the caller
+        // later drills into one of these locals.
+        let variables = self.fetch_children_and_cache(
+            scope.variables_reference,
+            None, // scope-level: children become root names
+            None,
+            30,
+            true,
+        ).await?;
+
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
-
-        let timeout = std::time::Duration::from_secs(5);
-        let variables = tokio::time::timeout(
-            timeout,
-            // Auto-enrichment runs on every stop. Even though we only ask for
-            // top-level locals (depth=0), CodeLLDB computes a "summary" string
-            // for each Variable's `value` field — and for a frame containing
-            // a struct with 5+ large container fields, that summary walks each
-            // container's synthetic provider, materialising children. The
-            // result: the supervisor kills the adapter on the first stop in a
-            // fat-state frame, before the user has a chance to ask for
-            // anything. Setting `no_synthetic=true` here tells CodeLLDB to use
-            // raw struct fields instead, skipping the per-element walk. The
-            // tradeoff: locals' `value` column shows raw struct shape rather
-            // than a pretty summary, but the names/types are unchanged and the
-            // user can still drill into any local explicitly.
-            client.variables_limited(scope.variables_reference, Some(30), None, true),
-        )
-        .await
-        .map_err(|_| crate::Error::Dap("Timeout fetching local variables".to_string()))??;
 
         let mut result = Vec::new();
         for var in variables.into_iter().take(20) {
@@ -1394,7 +1589,7 @@ impl DebugSession {
                 let expand_timeout = std::time::Duration::from_secs(3);
                 match tokio::time::timeout(expand_timeout, client.expand_variable(var.variables_reference, expand_depth)).await {
                     Ok(Ok(expanded)) if !expanded.is_empty() => {
-                        result.push(crate::dap::types::Variable {
+                        result.push(Variable {
                             value: format!("{}\n{}", var.value, expanded),
                             ..var
                         });
