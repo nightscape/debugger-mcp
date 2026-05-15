@@ -1,3 +1,4 @@
+pub mod output_format;
 pub mod protocol;
 pub mod resources;
 pub mod tools;

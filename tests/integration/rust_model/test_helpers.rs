@@ -247,7 +247,7 @@ pub async fn continue_and_wait(tools: &ToolsHandler, session_id: &str) -> Value 
     let wait = tool_call(
         tools,
         "debugger_wait_for_stop",
-        json!({"sessionId": session_id, "timeoutMs": 10000}),
+        json!({"sessionId": session_id, "timeoutMs": 10000, "enrichLocals": true}),
     )
     .await;
 

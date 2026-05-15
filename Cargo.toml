@@ -19,6 +19,9 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "json"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
 sysinfo = "0.35"
+# Token-Oriented Object Notation: compact, lossless JSON alternative for LLM output.
+# Library only — the default `cli` feature pulls ratatui/tiktoken/clap and is not needed here.
+toon-format = { version = "0.5.0", default-features = false }
 
 [dev-dependencies]
 tempfile = "3.23.0"
@@ -30,6 +33,9 @@ predicates = "3.1"
 sysinfo = "0.35"
 proptest = "1"
 proptest-state-machine = "0.8"
+# Token counting for the JSON-vs-TOON savings measurement test. o200k_base is the
+# GPT-4o tokenizer used as the public proxy by the TOON project's own benchmarks.
+tiktoken-rs = "0.7"
 
 [[test]]
 name = "fake_dap_adapter"
@@ -141,6 +147,21 @@ path = "tests/integration/line_tables_only_test.rs"
 [[test]]
 name = "async_state_machine_pbt_test"
 path = "tests/integration/async_state_machine_pbt_test.rs"
+
+# Async-closure initial-stop hang — reproduces failure mode #6: the very first
+# locals fetch on stop inside an async-fn-generated `{closure#…}` frame hangs
+# LLDB when captures include recursive `Value::Object(HashMap<String, Value>)`.
+# Pinned regression guards for the 2026-05-15 skip-locals fix
+# (`is_async_closure_frame` in `src/debug/async_state.rs`) and recovery paths
+# (`debugger_get_variables` with `noSynthetic:true`, `debugger_cancel`).
+[[test]]
+name = "async_closure_initial_stop_test"
+path = "tests/integration/async_closure_initial_stop_test.rs"
+
+# TOON vs JSON token-savings measurement over representative tool outputs.
+[[test]]
+name = "toon_token_savings_test"
+path = "tests/integration/toon_token_savings_test.rs"
 
 [[test]]
 name = "rust_init_test"

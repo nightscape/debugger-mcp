@@ -203,6 +203,12 @@ pub struct DisconnectArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CancelArgs {
+    pub session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionStateArgs {
     pub session_id: String,
 }
@@ -213,6 +219,14 @@ pub struct WaitForStopArgs {
     pub session_id: String,
     #[serde(default = "default_timeout", deserialize_with = "deserialize_u64_from_anything")]
     pub timeout_ms: u64,
+    /// Pre-fetch the top frame's locals on stop. Off by default — agents
+    /// should call `debugger_get_variables` explicitly when they need them.
+    /// The pre-fetch can hang or OOM CodeLLDB on frames where the captures
+    /// include large/recursive synthetic-formatted containers (async-fn
+    /// state machines, deep Vec<HashMap<…>>, recursive enums), and the
+    /// agent doesn't always need the data anyway.
+    #[serde(default, deserialize_with = "deserialize_bool_from_anything")]
+    pub enrich_locals: bool,
 }
 
 fn default_timeout() -> u64 {
@@ -330,6 +344,14 @@ async fn wait_for_stop_enriched(
     session: &crate::debug::session::DebugSession,
     timeout_ms: u64,
 ) -> crate::Result<Value> {
+    wait_for_stop_enriched_opts(session, timeout_ms, false).await
+}
+
+async fn wait_for_stop_enriched_opts(
+    session: &crate::debug::session::DebugSession,
+    timeout_ms: u64,
+    enrich_locals: bool,
+) -> crate::Result<Value> {
     let timeout = tokio::time::Duration::from_millis(timeout_ms);
     let start = tokio::time::Instant::now();
 
@@ -343,7 +365,7 @@ async fn wait_for_stop_enriched(
                 "reason": reason
             });
 
-            let ctx = build_stop_context(session, Some(3)).await;
+            let ctx = build_stop_context(session, Some(3), enrich_locals).await;
             if let Value::Object(map) = ctx {
                 for (k, v) in map {
                     result[k] = v;
@@ -433,6 +455,7 @@ async fn fetch_frame_variables(
 async fn build_stop_context(
     session: &crate::debug::session::DebugSession,
     stack_limit: Option<i32>,
+    enrich_locals: bool,
 ) -> Value {
     *session.last_tool_context.write().await =
         Some("build_stop_context variables".to_string());
@@ -462,9 +485,58 @@ async fn build_stop_context(
                 ctx["sourceContext"] = json!(source_ctx);
             }
 
-            // depth=0: names/types only, no child expansion (prevents memory explosion)
-            if let Some(var_list) = fetch_frame_variables(session, top.id, 0).await {
-                ctx["localVariables"] = json!(var_list);
+            // Default: do NOT pre-fetch locals on stop. The variables
+            // request is the single most expensive DAP call for many
+            // frames (synthetic providers walk large/recursive captures
+            // to compute summary strings), and the agent doesn't always
+            // need the data anyway. The caller opts in via `enrichLocals:
+            // true` on `debugger_wait_for_stop` if it really wants the
+            // pre-fetch — at the same cost-and-risk the old auto-path had.
+            //
+            // When opted out: surface a short hint pointing at the right
+            // recovery tools, with extra detail for async-closure frames
+            // because that's the case where the pre-fetch would have
+            // most likely hung anyway.
+            if enrich_locals {
+                if let Some(var_list) = fetch_frame_variables(session, top.id, 0).await {
+                    ctx["localVariables"] = json!(var_list);
+                }
+            } else {
+                ctx["localVariablesSkipped"] = json!(true);
+                let in_async_closure =
+                    crate::debug::async_state::is_async_closure_frame(&top.name);
+                ctx["hint"] = json!(if in_async_closure {
+                    "Locals not pre-fetched (default). This frame is an \
+                     async-closure ({{closure#…}}) — even an opt-in fetch \
+                     can hang LLDB on the state-machine union's synthetic \
+                     walk.\n\
+                     \n\
+                     Inspect now (cheap, by name — SAFE here):\n\
+                     - debugger_evaluate({sessionId, expression: \"<name>\", \
+                       context: \"watch\", noSynthetic: true})\n\
+                       For container lengths: expression: \"<name>.len\".\n\
+                     \n\
+                     Reading all locals at once is RISKY in async closures:\n\
+                     - debugger_get_variables can wedge LLDB on the \
+                       state-machine union (dispatcher gets stuck inside the \
+                       synthetic walk and does NOT respond to DAP cancel; \
+                       only debugger_disconnect recovers). Use only if you \
+                       already know which sibling locals exist and need the \
+                       full enumeration.\n\
+                     \n\
+                     Avoid the hang next run: move the BP one frame up to \
+                     the synchronous caller, or rebind into non-async scope \
+                     before the assert (`let len = db_rows.len(); ...`).\n\
+                     \n\
+                     If a later call hangs: debugger_cancel returns 0 \
+                     (CodeLLDB ignores cancel during synthetic walks) — \
+                     call debugger_disconnect and start fresh."
+                } else {
+                    "Locals not pre-fetched (default). Call \
+                     debugger_get_variables({sessionId, frameId}) when you \
+                     need them. Pass `enrichLocals: true` to \
+                     debugger_wait_for_stop to opt back into the auto-fetch."
+                });
             }
         }
     }
@@ -567,6 +639,7 @@ impl ToolsHandler {
             "debugger_debugging_tips" => self.debugger_debugging_tips(arguments).await,
             "debugger_set_data_breakpoint" => self.debugger_set_data_breakpoint(arguments).await,
             "debugger_get_variables" => self.debugger_get_variables(arguments).await,
+            "debugger_cancel" => self.debugger_cancel(arguments).await,
             _ => Err(Error::MethodNotFound(name.to_string())),
         }
     }
@@ -977,7 +1050,7 @@ impl ToolsHandler {
         };
 
         let result = session
-            .evaluate(&expression, args.frame_id, args.context)
+            .evaluate(&expression, args.frame_id, args.context.clone())
             .await;
 
         match result {
@@ -1041,6 +1114,23 @@ impl ToolsHandler {
                 if err_str.contains("timed out") {
                     session.cancel_pending_requests().await;
                 }
+                // If the agent didn't already pass noSynthetic, echo their
+                // exact expression back as a concrete retry recipe. They
+                // already wrote the expression; we just append `noSynthetic:
+                // true` to it — no source parsing, no guessing names.
+                // Preserve the error variant so the JSON-RPC code (-32009
+                // for AdapterStuck) stays correct.
+                if !args.no_synthetic && matches!(e, Error::AdapterStuck(_)) {
+                    let retry = format!(
+                        " Retry: debugger_evaluate({{\
+                         sessionId: \"{}\", expression: \"{}\", \
+                         context: \"{}\", noSynthetic: true}}).",
+                        args.session_id,
+                        args.expression.replace('\\', "\\\\").replace('"', "\\\""),
+                        context_str,
+                    );
+                    return Err(Error::AdapterStuck(format!("{err_str}{retry}")));
+                }
                 Err(e)
             }
         }
@@ -1052,7 +1142,7 @@ impl ToolsHandler {
         let manager = self.session_manager.read().await;
         let session = manager.get_session(&args.session_id).await?;
 
-        wait_for_stop_enriched(&session, args.timeout_ms).await
+        wait_for_stop_enriched_opts(&session, args.timeout_ms, args.enrich_locals).await
     }
 
     async fn debugger_list_breakpoints(&self, arguments: Value) -> Result<Value> {
@@ -1398,6 +1488,44 @@ impl ToolsHandler {
         Ok(json!({
             "status": "disconnected"
         }))
+    }
+
+    /// Cancel all in-flight DAP requests on the session without tearing it
+    /// down. Recovery path when an evaluate/variables call gets stuck inside
+    /// CodeLLDB's synthetic walk (typically deep async-closure captures).
+    /// Drops pending request senders client-side and fires a DAP `cancel`
+    /// for each one at the adapter. Subsequent tool calls on the same
+    /// session keep working; breakpoints are preserved.
+    async fn debugger_cancel(&self, arguments: Value) -> Result<Value> {
+        let args: CancelArgs = serde_json::from_value(arguments)?;
+        let manager = self.session_manager.read().await;
+        let session = manager.get_session(&args.session_id).await?;
+        let cancelled = session.cancel_pending_requests().await;
+        let mut result = json!({
+            "cancelled": cancelled,
+            "sessionId": args.session_id,
+        });
+        if cancelled == 0 {
+            // CodeLLDB does not preempt an in-flight synthetic-provider walk
+            // when it receives a DAP `cancel` — the dispatcher only sees it
+            // once the current LLDB call returns. So when our pending map is
+            // already empty (the prior timeout cleaned up its own orphan
+            // before returning AdapterStuck), repeatedly calling
+            // debugger_cancel will *never* unblock the adapter. The agent
+            // needs to know: the only effective recovery is to tear the
+            // session down. Surface that explicitly instead of letting the
+            // agent loop on cancel.
+            result["note"] = json!(
+                "No in-flight requests to cancel. If the previous call returned \
+                 AdapterStuck and subsequent calls still time out, the adapter \
+                 is wedged inside an LLDB synthetic-provider walk that does not \
+                 respond to DAP cancels. Recovery: call debugger_disconnect and \
+                 start a fresh session, avoiding the stuck frame (set the \
+                 breakpoint one frame up at the synchronous caller, or rebind \
+                 the values you need into a non-async scope before the assert)."
+            );
+        }
+        Ok(result)
     }
 
     async fn debugger_debugging_tips(&self, arguments: Value) -> Result<Value> {
@@ -1885,6 +2013,28 @@ impl ToolsHandler {
                 }
             }),
             json!({
+                "name": "debugger_cancel",
+                "title": "Cancel In-Flight Requests",
+                "description": "Drops all pending DAP requests on the session (client-side) and fires a DAP `cancel` to the adapter for each. Use this to recover when an `evaluate` or `get_variables` call gets stuck — typically CodeLLDB walking the synthetic providers of deep async-closure captures. Breakpoints and session state are preserved; the next tool call should work normally. Returns `{cancelled: <count>}`.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sessionId": {
+                            "type": "string",
+                            "description": "Session ID from debugger_start"
+                        }
+                    },
+                    "required": ["sessionId"]
+                },
+                "annotations": {
+                    "async": false,
+                    "returnsTiming": "<10ms",
+                    "workflow": "recovery",
+                    "category": "session-management",
+                    "priority": 0.5
+                }
+            }),
+            json!({
                 "name": "debugger_disconnect",
                 "title": "Disconnect Session",
                 "description": "Terminates the debug session and frees its resources. The debugged program is stopped if still running.",
@@ -1910,7 +2060,7 @@ impl ToolsHandler {
             json!({
                 "name": "debugger_wait_for_stop",
                 "title": "Wait For Program To Stop",
-                "description": "Blocks until the session stops (breakpoint, step, entry, pause), terminates, or `timeoutMs` elapses. Returns `{state, threadId, reason}` plus enriched context. More efficient than polling debugger_session_state.",
+                "description": "Blocks until the session stops (breakpoint, step, entry, pause), terminates, or `timeoutMs` elapses. Returns `{state, threadId, reason}` plus stack trace, top frame, and source context. Local variables are NOT pre-fetched by default — call debugger_get_variables when you need them, or pass `enrichLocals: true` to opt back into the auto-fetch.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -1922,6 +2072,11 @@ impl ToolsHandler {
                             "type": "integer",
                             "default": 5000,
                             "description": "Maximum time to wait in milliseconds (default: 5000)"
+                        },
+                        "enrichLocals": {
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Pre-fetch the top frame's locals. Off by default — the variables request is expensive and can hang or OOM CodeLLDB on frames with large/recursive/async-state-machine captures. Set true when you specifically want the auto-fetch (the old behavior)."
                         }
                     },
                     "required": ["sessionId"]
@@ -2297,7 +2452,7 @@ mod tests {
     #[test]
     fn test_list_tools() {
         let tools = ToolsHandler::list_tools();
-        assert_eq!(tools.len(), 20);
+        assert_eq!(tools.len(), 21);
 
         // Verify tool names
         let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();

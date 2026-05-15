@@ -53,6 +53,45 @@ Start debugging from Claude!
 
 ---
 
+## Configuration
+
+### Environment Variables
+
+| Variable | Values | Default | Description |
+|----------|--------|---------|-------------|
+| `DEBUGGER_MCP_OUTPUT_FORMAT` | `toon`, `json` | `toon` | Wire encoding for tool results sent to the AI agent. |
+
+#### `DEBUGGER_MCP_OUTPUT_FORMAT`
+
+Controls how every `debugger_*` tool result is encoded before it is placed in
+the MCP response.
+
+- **`toon`** (default) — [Token-Oriented Object Notation](https://github.com/toon-format/toon),
+  a compact, lossless re-encoding of the JSON data model. Uniform arrays
+  (stack frames, variables, breakpoints) collapse into a tabular form with the
+  keys written once, cutting tool-output tokens by **~45%** across
+  representative payloads with no loss of information.
+- **`json`** — pretty-printed JSON. Useful when debugging the raw wire output
+  or for clients that expect plain JSON.
+
+An unrecognised value fails fast at startup rather than silently falling back.
+
+Set it in your MCP client config, e.g. for Claude Desktop:
+
+```json
+{
+  "mcpServers": {
+    "debugger": {
+      "command": "/path/to/debugger_mcp",
+      "args": ["serve"],
+      "env": { "DEBUGGER_MCP_OUTPUT_FORMAT": "json" }
+    }
+  }
+}
+```
+
+---
+
 ## Status
 
 🎉 **Production-Ready** - Multi-Language Support

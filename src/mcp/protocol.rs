@@ -211,7 +211,7 @@ impl ProtocolHandler {
                 result: Some(serde_json::json!({
                     "content": [{
                         "type": "text",
-                        "text": serde_json::to_string_pretty(&result).unwrap_or_else(|_| "{}".to_string())
+                        "text": crate::mcp::output_format::OutputFormat::from_env().encode(&result)
                     }]
                 })),
                 error: None,

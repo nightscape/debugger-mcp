@@ -107,12 +107,25 @@ impl RustAdapter {
     /// returns empty (debugging still works, just without pretty-printing).
     fn rust_lldb_init_commands() -> Vec<String> {
         let mut commands = vec![
-            // Limit children enumeration to prevent memory explosion.
-            // Without this, LLDB materialises ALL children of Vec/HashMap/BTreeMap
-            // when producing variable summaries, causing multi-GB RSS for large
-            // collections.  20 is enough for the AI to see the shape of the data.
-            "settings set target.max-children-count 20".to_string(),
-            // Limit string summary length to prevent large string allocations.
+            // Conservative LLDB formatter cost budget. Defaults are tuned
+            // for IDE panes; agents driving DAP need much tighter caps to
+            // avoid synthetic-walk hangs on large/recursive captures.
+            //
+            // max-children-count: how many children synthetic providers
+            //   emit per container. 16 is enough to read a Vec/HashMap's
+            //   first page; agents paginate with maxCount.
+            // max-children-depth: how many nesting levels the walker
+            //   descends. 1 = "expand this container, show grandchildren
+            //   as opaque" — keeps recursive enums (Value::Object(HashMap<
+            //   String, Value>)) and nested HashMaps from blowing up.
+            // max-string-summary-length: per-string truncation. 256 is
+            //   enough to identify what a String is; full inspection goes
+            //   through get_variables with explicit drill.
+            //
+            // (LLDB setting key is `max-children-depth`, NOT
+            // `max-summary-depth` — the latter does not exist.)
+            "settings set target.max-children-count 16".to_string(),
+            "settings set target.max-children-depth 1".to_string(),
             "settings set target.max-string-summary-length 256".to_string(),
         ];
 
@@ -1029,12 +1042,18 @@ mod tests {
         let commands = config["initCommands"].as_array().unwrap();
 
         // Memory safety settings should always be present
-        assert!(
-            commands.iter().any(|c| c.as_str().unwrap().contains("target.max-children-count")),
-            "Init commands should set target.max-children-count"
-        );
+        for needle in [
+            "target.max-children-count 16",
+            "target.max-children-depth 1",
+            "target.max-string-summary-length 256",
+        ] {
+            assert!(
+                commands.iter().any(|c| c.as_str().unwrap().contains(needle)),
+                "Init commands should set `{needle}`",
+            );
+        }
 
-        if commands.len() > 2 {
+        if commands.len() > 3 {
             // Formatter commands follow the safety settings
             assert!(
                 commands.iter().any(|c| c.as_str().unwrap().contains("lldb_lookup.py")),

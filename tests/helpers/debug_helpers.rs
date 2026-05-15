@@ -221,7 +221,9 @@ impl DebugTestHarness {
         }
     }
 
-    /// Continue execution and wait for stop.
+    /// Continue execution and wait for stop. Opts into `enrichLocals: true`
+    /// so existing tests that assert on `localVariables` keep working with
+    /// the wrapper's new default (locals not pre-fetched).
     pub async fn continue_and_wait(&self, session_id: &str, timeout_ms: u64) -> Option<Value> {
         self.tools
             .handle_tool("debugger_continue", json!({"sessionId": session_id}))
@@ -234,7 +236,8 @@ impl DebugTestHarness {
                 "debugger_wait_for_stop",
                 json!({
                     "sessionId": session_id,
-                    "timeoutMs": timeout_ms
+                    "timeoutMs": timeout_ms,
+                    "enrichLocals": true
                 }),
             ),
         )

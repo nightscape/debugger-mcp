@@ -4,7 +4,7 @@ use super::types::*;
 use crate::{Error, Result};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
@@ -32,6 +32,11 @@ pub struct DapClient {
     child_session_spawn_callback: Arc<RwLock<Option<ChildSessionSpawnCallback>>>,
     // Channel for sending write requests to avoid lock contention
     write_tx: mpsc::UnboundedSender<Message>,
+    // Set to false when the adapter dies (write_message fails or stream closes).
+    // Used to distinguish "MCP client bug closed the channel" from "the debug
+    // adapter process exited" — the latter is what users actually hit when
+    // LLDB or the debugged program crashes mid-evaluate.
+    adapter_alive: Arc<AtomicBool>,
     _child: Option<Child>,
 }
 
@@ -84,6 +89,7 @@ impl DapClient {
         let event_notifiers = Arc::new(RwLock::new(HashMap::new()));
         let event_callbacks = Arc::new(RwLock::new(HashMap::new()));
         let child_session_spawn_callback = Arc::new(RwLock::new(None));
+        let adapter_alive = Arc::new(AtomicBool::new(true));
 
         let client = Self {
             transport: transport.clone(),
@@ -94,6 +100,7 @@ impl DapClient {
             event_callbacks: event_callbacks.clone(),
             child_session_spawn_callback: child_session_spawn_callback.clone(),
             write_tx: write_tx.clone(),
+            adapter_alive: adapter_alive.clone(),
             _child: child,
         };
 
@@ -105,10 +112,15 @@ impl DapClient {
             event_callbacks.clone(),
             child_session_spawn_callback.clone(),
             event_rx,
+            adapter_alive.clone(),
         ));
 
         // Spawn message writer handler
-        tokio::spawn(Self::message_writer(transport.clone(), write_rx));
+        tokio::spawn(Self::message_writer(
+            transport.clone(),
+            write_rx,
+            adapter_alive.clone(),
+        ));
 
         Ok(client)
     }
@@ -121,6 +133,7 @@ impl DapClient {
         event_callbacks: Arc<RwLock<HashMap<String, Vec<EventCallback>>>>,
         child_session_spawn_callback: Arc<RwLock<Option<ChildSessionSpawnCallback>>>,
         mut _event_rx: mpsc::UnboundedReceiver<Event>,
+        adapter_alive: Arc<AtomicBool>,
     ) {
         loop {
             debug!("📖 message_reader: Attempting to acquire transport lock");
@@ -154,6 +167,7 @@ impl DapClient {
                 Some(Ok(msg)) => msg,
                 Some(Err(e)) => {
                     error!("📖 message_reader: Failed to read DAP message: {}", e);
+                    adapter_alive.store(false, Ordering::SeqCst);
                     break;
                 }
             };
@@ -292,6 +306,7 @@ impl DapClient {
     async fn message_writer(
         transport: Arc<Mutex<Box<dyn DapTransportTrait>>>,
         mut write_rx: mpsc::UnboundedReceiver<Message>,
+        adapter_alive: Arc<AtomicBool>,
     ) {
         info!("📝 message_writer: Task started");
         while let Some(message) = write_rx.recv().await {
@@ -306,6 +321,7 @@ impl DapClient {
             info!("📝 message_writer: Lock acquired, writing message");
             if let Err(e) = transport.write_message(&message).await {
                 error!("📝 message_writer: Failed to write DAP message: {}", e);
+                adapter_alive.store(false, Ordering::SeqCst);
                 break;
             }
             info!("📝 message_writer: Message written successfully, releasing lock");
@@ -458,7 +474,7 @@ impl DapClient {
         info!("✉️  send_request: Sending message to write channel");
         self.write_tx
             .send(Message::Request(request))
-            .map_err(|_| Error::Dap("Write channel closed".to_string()))?;
+            .map_err(|_| self.write_channel_error())?;
 
         info!("✉️  send_request: Waiting for response to seq {}", seq);
         let response = rx
@@ -528,7 +544,7 @@ impl DapClient {
 
         self.write_tx
             .send(Message::Request(request))
-            .map_err(|_| Error::Dap("Write channel closed".to_string()))?;
+            .map_err(|_| self.write_channel_error())?;
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(response)) => {
@@ -540,18 +556,54 @@ impl DapClient {
             }
             Ok(Err(_)) => {
                 self.pending_requests.write().await.remove(&seq);
+                if !self.adapter_alive.load(Ordering::SeqCst) {
+                    return Err(self.write_channel_error());
+                }
                 Err(Error::Dap("Request cancelled or connection closed".to_string()))
             }
             Err(_) => {
                 self.pending_requests.write().await.remove(&seq);
+                // If the adapter died while we were waiting, the timeout is a
+                // misleading symptom — surface the real cause so the caller
+                // knows to restart instead of retrying.
+                if !self.adapter_alive.load(Ordering::SeqCst) {
+                    return Err(self.write_channel_error());
+                }
                 warn!(
-                    "⏱️  send_request_with_timeout: '{}' (seq {}) timed out after {:?}, sending DAP cancel and cleaning up",
+                    "⏱️  send_request_with_timeout: '{}' (seq {}) timed out after {:?}, sending DAP cancel and pinging",
                     command, seq, timeout
                 );
                 self.send_cancel(seq).await;
-                Err(Error::Dap(format!(
-                    "Request '{}' timed out after {:?}",
-                    command, timeout
+
+                // Stuck-vs-dead disambiguation. The adapter process is alive
+                // (adapter_alive check above), but the request did not return.
+                // Two sub-cases:
+                //   (a) the adapter's dispatcher is free — our original request
+                //       was inside an LLDB call that we just cancelled, and the
+                //       next request can be served. A `threads` ping returns
+                //       quickly.
+                //   (b) the adapter is wedged inside LLDB (synthetic walk on a
+                //       large container is the common cause) and won't dispatch
+                //       new requests either — the ping also times out.
+                // Both cases need a different recovery from `AdapterExited`:
+                // `debugger_cancel` may free (a); (b) typically needs
+                // `debugger_disconnect` + restart. We surface them as one error
+                // variant (`AdapterStuck`) with a sub-classifier in the message
+                // so the agent can pick the right tool.
+                const PING_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
+                let responsive = self.ping_threads(PING_DEADLINE).await;
+                let sub = if responsive {
+                    "adapter responsive after cancel"
+                } else {
+                    "adapter dispatcher wedged"
+                };
+                let hint = if responsive {
+                    "Recovery: retry the request with `noSynthetic: true`, evaluate a scalar field (e.g. `name.len`) instead of the container, or call `debugger_cancel` if subsequent calls hang."
+                } else {
+                    "Recovery: call `debugger_cancel` first (may free the dispatcher); if that does not unblock, `debugger_disconnect` and start fresh — avoid the stuck frame or set the breakpoint one frame up. The memory supervisor may kill the adapter if RSS keeps climbing."
+                };
+                Err(Error::AdapterStuck(format!(
+                    "Request '{command}' timed out after {timeout:?} ({sub}). {hint}"
                 )))
             }
         }
@@ -590,7 +642,7 @@ impl DapClient {
         );
         self.write_tx
             .send(Message::Request(request))
-            .map_err(|_| Error::Dap("Write channel closed".to_string()))?;
+            .map_err(|_| self.write_channel_error())?;
         debug!("send_request_async: Request queued");
 
         // Spawn task to wait for response and invoke callback
@@ -945,7 +997,29 @@ impl DapClient {
             event_callbacks: self.event_callbacks.clone(),
             child_session_spawn_callback: self.child_session_spawn_callback.clone(),
             write_tx: self.write_tx.clone(),
+            adapter_alive: self.adapter_alive.clone(),
             _child: None, // Don't clone the child process
+        }
+    }
+
+    /// Map a write_tx send failure into the right error.
+    ///
+    /// If the adapter has died (writer task exited because `write_message`
+    /// errored, or reader task exited because the stream closed), surface
+    /// `Error::AdapterExited` so the caller knows the process is gone and
+    /// the only recovery is to restart the session. Otherwise the channel
+    /// closing is an internal bug — keep the old "Write channel closed"
+    /// string so it's grep-able in logs.
+    fn write_channel_error(&self) -> Error {
+        if !self.adapter_alive.load(Ordering::SeqCst) {
+            Error::AdapterExited(
+                "the debug adapter process exited (likely caused by the debugged \
+                 program crashing or LLDB itself running out of memory). Restart \
+                 the debug session to recover."
+                    .to_string(),
+            )
+        } else {
+            Error::Dap("Write channel closed".to_string())
         }
     }
 
@@ -967,6 +1041,39 @@ impl DapClient {
                 "🚫 Sent DAP cancel for timed-out request seq {} (cancel seq {})",
                 request_seq, cancel_seq
             );
+        }
+    }
+
+    /// Fire a `threads` request with a short deadline as a liveness probe.
+    /// Used post-timeout to distinguish "adapter dispatcher is free, just
+    /// this request was stuck inside LLDB" from "adapter is wedged and
+    /// won't dispatch anything new". Does not surface errors — returns
+    /// `true` iff a response came back inside `deadline`. On false, the
+    /// ping's pending-request entry stays orphaned; the next
+    /// `send_request_with_timeout` will clean it up via
+    /// `cancel_pending_requests`.
+    async fn ping_threads(&self, deadline: std::time::Duration) -> bool {
+        let seq = self.seq_counter.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_requests.write().await;
+            pending.insert(seq, tx);
+        }
+        let req = Request {
+            seq,
+            command: "threads".to_string(),
+            arguments: None,
+        };
+        if self.write_tx.send(Message::Request(req)).is_err() {
+            self.pending_requests.write().await.remove(&seq);
+            return false;
+        }
+        match tokio::time::timeout(deadline, rx).await {
+            Ok(Ok(_)) => true,
+            _ => {
+                self.pending_requests.write().await.remove(&seq);
+                false
+            }
         }
     }
 
@@ -1397,7 +1504,7 @@ impl DapClient {
             levels,
         };
 
-        let timeout = std::time::Duration::from_secs(10);
+        let timeout = super::timeouts::stack_trace();
         let response = self
             .send_request_with_timeout("stackTrace", Some(serde_json::to_value(args)?), timeout)
             .await
@@ -1434,7 +1541,7 @@ impl DapClient {
     pub async fn scopes(&self, frame_id: i32) -> Result<Vec<Scope>> {
         let args = ScopesArguments { frame_id };
 
-        let timeout = std::time::Duration::from_secs(10);
+        let timeout = super::timeouts::scopes();
         let response = self
             .send_request_with_timeout("scopes", Some(serde_json::to_value(args)?), timeout)
             .await?;
@@ -1493,14 +1600,11 @@ impl DapClient {
             },
         };
 
-        // 4s — chosen so the request is cancelled before the supervisor (which
-        // polls every 500ms with a low RSS limit in tests) has time to kill
-        // the adapter. CodeLLDB can still allocate during this window, but the
-        // DAP cancel triggered on timeout (see send_request_with_timeout)
-        // unwinds the synthetic provider before it exhausts memory in most
-        // cases. If you genuinely need to wait longer, raise the limit
-        // explicitly via session config — don't widen this default.
-        let timeout = std::time::Duration::from_secs(4);
+        // Default 4s — chosen so the request is cancelled before the supervisor
+        // (which polls every 500ms with a low RSS limit in tests) has time to
+        // kill the adapter. Override with DAP_VARIABLES_TIMEOUT_MS for large
+        // Rust binaries where DWARF lookups are slow.
+        let timeout = super::timeouts::variables_limited();
         let response = self
             .send_request_with_timeout("variables", Some(serde_json::to_value(args)?), timeout)
             .await
@@ -1544,7 +1648,7 @@ impl DapClient {
             format: None,
         };
 
-        let timeout = std::time::Duration::from_secs(10);
+        let timeout = super::timeouts::variables_full();
         let response = self
             .send_request_with_timeout("variables", Some(serde_json::to_value(args)?), timeout)
             .await
@@ -1745,14 +1849,12 @@ impl DapClient {
             },
         };
 
-        // 8s for evaluate — tighter than the previous 15s default. The user-
-        // reported "scalar field path explodes" failure consumed the full 15s
-        // before erroring; halving the budget gets the caller a structured
-        // error and a recommendation faster, without blocking long enough for
-        // CodeLLDB to chew through 4 GB. If the underlying expression is
-        // genuinely slow (Python eval, expensive method call), the caller
-        // should split the work — not extend this timeout.
-        let timeout = std::time::Duration::from_secs(8);
+        // Default 8s. Override via DAP_EVAL_TIMEOUT_MS for huge Rust binaries
+        // where first-touch DWARF lookups for a single name can take >30s.
+        // Tight default is intentional: a fast failure with a structured error
+        // is more useful than a long block — extend only when you know the
+        // binary actually needs it.
+        let timeout = super::timeouts::evaluate();
         let response = self
             .send_request_with_timeout("evaluate", Some(serde_json::to_value(args)?), timeout)
             .await
@@ -2311,6 +2413,28 @@ mod tests {
         }
     }
 
+    /// Like `recv_request`, but transparently skips DAP `cancel` requests
+    /// (fired async after a prior timeout) and post-timeout `threads` pings
+    /// (fired by `send_request_with_timeout` for stuck-vs-dead disambiguation).
+    /// Tests that fire multiple requests in sequence need this so they see
+    /// the next *user* request, not the recovery housekeeping.
+    async fn recv_request_skipping_cancels(
+        pair: &mut ChannelTransportPair,
+    ) -> (i32, String, Option<Value>) {
+        loop {
+            let msg = pair.outgoing_rx.recv().await.expect("channel closed");
+            match msg {
+                Message::Request(req)
+                    if req.command == "cancel" || req.command == "threads" =>
+                {
+                    continue
+                }
+                Message::Request(req) => return (req.seq, req.command, req.arguments),
+                other => panic!("Expected request, got {:?}", other),
+            }
+        }
+    }
+
     /// Helper: send a success response back to the client
     fn send_response(pair: &ChannelTransportPair, request_seq: i32, command: &str, body: Option<Value>) {
         pair.incoming_tx
@@ -2515,5 +2639,246 @@ mod tests {
         // Verify pending map is now empty
         let pending_count = client.pending_requests.read().await.len();
         assert_eq!(pending_count, 0, "Pending requests should be empty after cancel");
+    }
+
+    // ========================================================================
+    // Bug reproduction: holon-style timeout cascade — distinguishes a slow
+    // adapter (recoverable) from a dead adapter (must restart).
+    // ========================================================================
+
+    /// A 200ms evaluate timeout against a never-responding transport produces
+    /// a structured `Request '...' timed out after ...` error, cleans up the
+    /// orphaned pending entry, and leaves `adapter_alive` true so subsequent
+    /// requests can still try. This mirrors the 8s evaluate timeout that hit
+    /// in the holon incident, just compressed so the test runs fast.
+    #[tokio::test]
+    async fn test_tiny_eval_timeout_cleans_up_without_poisoning() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        let client_clone = client.clone_for_callback();
+        let handle = tokio::spawn(async move {
+            client_clone
+                .send_request_with_timeout(
+                    "evaluate",
+                    Some(json!({"expression": "resolved_id"})),
+                    std::time::Duration::from_millis(200),
+                )
+                .await
+        });
+
+        let (_seq, cmd, _) = recv_request(&mut pair).await;
+        assert_eq!(cmd, "evaluate");
+
+        // send_request_with_timeout: 200ms wait → DAP cancel → 1s threads
+        // ping (never answered here, since this test stubs the transport) →
+        // return AdapterStuck. We just await the eventual result.
+        let result = handle.await.unwrap();
+        let err = result.expect_err("evaluate should time out");
+        match err {
+            Error::AdapterStuck(msg) => {
+                assert!(
+                    msg.contains("timed out"),
+                    "expected timeout message, got: {msg}"
+                );
+                assert!(
+                    msg.contains("wedged"),
+                    "ping was unanswered, expected 'dispatcher wedged' classifier, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::AdapterStuck timeout, got {other:?}"),
+        }
+
+        // Drain the cancel + ping that send_request_with_timeout fired.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        while pair.outgoing_rx.try_recv().is_ok() {}
+
+        // Adapter is still alive — we just timed out. Pending map is clean.
+        assert!(
+            client.adapter_alive.load(Ordering::SeqCst),
+            "timeout alone should not mark adapter dead"
+        );
+        assert_eq!(
+            client.pending_requests.read().await.len(),
+            0,
+            "orphan must be cleaned"
+        );
+    }
+
+    /// When the adapter's stdout/socket closes mid-session (process died), the
+    /// reader task sets `adapter_alive=false`. A pending request that was
+    /// waiting for a response surfaces this as `Error::AdapterExited` instead
+    /// of the misleading `"Request cancelled or connection closed"` or the
+    /// hard-to-act-on `"Write channel closed"` we used to return.
+    ///
+    /// This is the exact symptom from the holon incident: after evaluate
+    /// timed out, `continue` returned "Write channel closed" — what we
+    /// actually wanted to tell the user was "the debug adapter died".
+    #[tokio::test]
+    async fn test_adapter_death_surfaces_as_adapter_exited() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        // Kick off a request. Don't respond — the reader will eventually
+        // see the channel close.
+        let client_clone = client.clone_for_callback();
+        let handle = tokio::spawn(async move {
+            client_clone
+                .send_request_with_timeout(
+                    "continue",
+                    Some(json!({"threadId": 1})),
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+        });
+
+        let (_seq, cmd, _) = recv_request(&mut pair).await;
+        assert_eq!(cmd, "continue");
+
+        // Simulate adapter death: drop both ends of the transport. The reader
+        // sees the incoming channel close, the writer sees outgoing closed —
+        // both flip `adapter_alive` to false.
+        drop(pair);
+
+        let result = handle.await.unwrap();
+        let err = result.expect_err("continue should fail once adapter dies");
+        assert!(
+            matches!(err, Error::AdapterExited(_)),
+            "expected AdapterExited, got: {err:?}"
+        );
+
+        // A second request after death also returns AdapterExited — not
+        // a stale "Write channel closed" string.
+        let second = client
+            .send_request_with_timeout(
+                "continue",
+                Some(json!({"threadId": 1})),
+                std::time::Duration::from_millis(500),
+            )
+            .await
+            .expect_err("second request should fail with AdapterExited");
+        assert!(
+            matches!(second, Error::AdapterExited(_)),
+            "second request should also surface AdapterExited, got: {second:?}"
+        );
+    }
+
+    /// Stuck-vs-dead disambiguation: if the post-timeout `threads` ping is
+    /// answered, the error classifier reports "adapter responsive after
+    /// cancel" — not "wedged". Mirrors the case where the original request
+    /// was stuck inside a single LLDB call that the cancel cleared, after
+    /// which the adapter dispatcher is free to serve new requests.
+    #[tokio::test]
+    async fn test_timeout_ping_responsive_classifier() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        let client_clone = client.clone_for_callback();
+        let handle = tokio::spawn(async move {
+            client_clone
+                .send_request_with_timeout(
+                    "evaluate",
+                    Some(json!({"expression": "x"})),
+                    std::time::Duration::from_millis(150),
+                )
+                .await
+        });
+
+        // Drain the initial evaluate — don't respond, force a timeout.
+        let (_seq, cmd, _) = recv_request(&mut pair).await;
+        assert_eq!(cmd, "evaluate");
+
+        // After timeout the client fires a DAP `cancel` then a `threads` ping.
+        // recv_request_skipping_cancels also skips threads (for tests that fire
+        // multiple user requests in a row) — here we want the threads ping,
+        // so consume requests directly and look for it.
+        let mut ping_seq = None;
+        for _ in 0..4 {
+            let (seq, cmd, _) = recv_request(&mut pair).await;
+            if cmd == "threads" {
+                ping_seq = Some(seq);
+                break;
+            }
+            // "cancel" or anything else — ignore and keep waiting.
+        }
+        let ping_seq = ping_seq.expect("did not see threads ping after timeout");
+        send_response(&pair, ping_seq, "threads", Some(json!({"threads": []})));
+
+        let err = handle.await.unwrap().expect_err("evaluate should timeout");
+        match err {
+            Error::AdapterStuck(msg) => {
+                assert!(
+                    msg.contains("responsive after cancel"),
+                    "expected 'responsive after cancel' classifier, got: {msg}"
+                );
+            }
+            other => panic!("expected AdapterStuck, got {other:?}"),
+        }
+    }
+
+    /// Multiple timeouts in a row, then a successful request — the holon
+    /// "after 3 timeouts every request fails" symptom is *not* present when
+    /// the adapter is still alive. This locks in the diagnosis: the cascade
+    /// failure was adapter death, not a session-poisoning bug in MCP.
+    #[tokio::test]
+    async fn test_repeated_timeouts_do_not_poison_session() {
+        let (transport, mut pair) = create_channel_transport();
+        let client = DapClient::new_with_transport(transport, None)
+            .await
+            .unwrap();
+
+        for _ in 0..3 {
+            let client_clone = client.clone_for_callback();
+            let handle = tokio::spawn(async move {
+                client_clone
+                    .send_request_with_timeout(
+                        "evaluate",
+                        Some(json!({"expression": "slow"})),
+                        std::time::Duration::from_millis(150),
+                    )
+                    .await
+            });
+            let (_seq, cmd, _) = recv_request_skipping_cancels(&mut pair).await;
+            assert_eq!(cmd, "evaluate");
+            let res = handle.await.unwrap();
+            assert!(res.is_err(), "each evaluate should time out");
+        }
+
+        // 4th request: respond to it successfully.
+        let client_clone = client.clone_for_callback();
+        let success_handle = tokio::spawn(async move {
+            client_clone
+                .send_request_with_timeout(
+                    "continue",
+                    Some(json!({"threadId": 1})),
+                    std::time::Duration::from_secs(2),
+                )
+                .await
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let (seq, cmd, _) =
+            tokio::time::timeout_at(deadline, recv_request_skipping_cancels(&mut pair))
+                .await
+                .expect("continue request must arrive after the timeouts");
+        assert_eq!(cmd, "continue");
+        send_response(&pair, seq, "continue", None);
+
+        let res = success_handle.await.unwrap();
+        assert!(
+            res.is_ok(),
+            "continue must succeed after prior timeouts — got {:?}",
+            res.err()
+        );
+        assert!(
+            client.adapter_alive.load(Ordering::SeqCst),
+            "adapter should still be alive"
+        );
     }
 }

@@ -788,6 +788,12 @@ impl DebugSession {
         // (after 'initialized' event, before configurationDone - the correct DAP sequence)
         // This fixes the Go debugging issue where breakpoints were being applied too late
 
+        // LLDB formatter cost-budget settings (max-children-count etc.) are
+        // applied via the CodeLLDB `initCommands` array in the launch args,
+        // not here — they run before the program does, no post-launch race
+        // with breakpoint-verification or DAP event flow. See
+        // `RustAdapter::rust_lldb_init_commands` for the values.
+
         // Give DAP events a moment to arrive (stopped, continued, terminated).
         // If after 500ms the state is still Initializing, no event came — set Running
         // as a fallback so the session doesn't get stuck forever.
@@ -1650,12 +1656,14 @@ impl DebugSession {
 
     /// Cancel all pending DAP requests on this session's debug client.
     /// Used for recovery after a timed-out evaluate/variables request
-    /// so that subsequent operations can proceed.
-    pub async fn cancel_pending_requests(&self) {
+    /// so that subsequent operations can proceed. Returns the number of
+    /// requests that were dropped.
+    pub async fn cancel_pending_requests(&self) -> usize {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
-        client.cancel_pending_requests().await;
+        client.cancel_pending_requests().await
     }
+
 
     pub async fn disconnect(&self) -> Result<()> {
         let client_arc = self.get_debug_client().await;

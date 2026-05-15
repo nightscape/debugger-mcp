@@ -35,6 +35,16 @@ pub enum Error {
     #[error("Compilation error: {0}")]
     Compilation(String),
 
+    #[error("Debug adapter exited: {0}")]
+    AdapterExited(String),
+
+    /// The adapter process is alive but a request timed out. Distinguished
+    /// from `Error::Timeout` and `AdapterExited` so callers (and the agent
+    /// reading the error) can recover via `debugger_cancel` instead of
+    /// restarting the whole session.
+    #[error("Debug adapter stuck: {0}")]
+    AdapterStuck(String),
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -49,6 +59,8 @@ impl Error {
             Error::InvalidState(_) => -32005,
             Error::Timeout(_) => -32006,
             Error::Compilation(_) => -32007,
+            Error::AdapterExited(_) => -32008,
+            Error::AdapterStuck(_) => -32009,
             Error::InvalidRequest(_) => -32600,
             Error::MethodNotFound(_) => -32601,
             Error::Internal(_) => -32603,
@@ -108,6 +120,16 @@ mod tests {
         let err = Error::Internal("unexpected state".to_string());
         assert_eq!(err.error_code(), -32603);
         assert_eq!(err.to_string(), "Internal error: unexpected state");
+    }
+
+    #[test]
+    fn test_adapter_exited_error() {
+        let err = Error::AdapterExited("process exited with signal 9".to_string());
+        assert_eq!(err.error_code(), -32008);
+        assert_eq!(
+            err.to_string(),
+            "Debug adapter exited: process exited with signal 9"
+        );
     }
 
     #[test]
