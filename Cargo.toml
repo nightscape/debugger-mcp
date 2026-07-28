@@ -158,6 +158,15 @@ path = "tests/integration/async_state_machine_pbt_test.rs"
 name = "async_closure_initial_stop_test"
 path = "tests/integration/async_closure_initial_stop_test.rs"
 
+# 7th LLDB failure-mode reproducer: reading one scalar out of a *synchronous*
+# frame whose `&mut self` owns several large HashMap/BTreeMap fields. The async
+# detectors in `src/debug/async_state.rs` don't fire here, so nothing currently
+# keeps the scope-level `variables` request off CodeLLDB's per-Variable summary
+# walk. Also pins the REPL expression-form inconsistencies from the same report.
+[[test]]
+name = "heavy_sync_frame_test"
+path = "tests/integration/heavy_sync_frame_test.rs"
+
 # TOON vs JSON token-savings measurement over representative tool outputs.
 [[test]]
 name = "toon_token_savings_test"

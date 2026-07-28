@@ -7,6 +7,7 @@
 use proptest::prelude::*;
 
 use super::ast::{BinOp, Block, Expr, PrimType, Program, Stmt, Type};
+use super::codegen::FrameShape;
 
 /// Tunable: how many ops a generated program contains (excluding declarations
 /// and trailing observation).
@@ -92,6 +93,62 @@ pub fn program_strategy() -> BoxedStrategy<Program> {
     proptest::collection::vec(op_strategy(), MIN_OPS..=MAX_OPS)
         .prop_map(build_program)
         .boxed()
+}
+
+/// Size tiers for the ballast axis. `fast` keeps generated programs cheap to
+/// compile; `heavy` reaches the scale at which the reported wedge reproduces.
+struct Tier {
+    ballast_fields: (usize, usize),
+    ballast_size: (usize, usize),
+    ballast_locals: (usize, usize),
+    recursion_depth: (usize, usize),
+    dwarf_types: (usize, usize),
+}
+
+const FAST_TIER: Tier = Tier {
+    ballast_fields: (0, 3),
+    ballast_size: (0, 64),
+    ballast_locals: (0, 2),
+    recursion_depth: (0, 3),
+    dwarf_types: (0, 8),
+};
+
+const HEAVY_TIER: Tier = Tier {
+    ballast_fields: (2, 6),
+    ballast_size: (2000, 20000),
+    ballast_locals: (1, 3),
+    recursion_depth: (0, 6),
+    dwarf_types: (200, 2000),
+};
+
+fn current_tier() -> &'static Tier {
+    match std::env::var("MINI_RUST_TIER").as_deref().unwrap_or("fast") {
+        "fast" => &FAST_TIER,
+        "heavy" => &HEAVY_TIER,
+        other => panic!("unknown MINI_RUST_TIER {other:?}: expected \"fast\" or \"heavy\""),
+    }
+}
+
+/// Ballast dimensions for the observing frame. Every range shrinks toward its
+/// low end, so a failure minimizes to the smallest ballast that still triggers.
+pub fn frame_shape_strategy() -> BoxedStrategy<FrameShape> {
+    let t = current_tier();
+    (
+        t.ballast_fields.0..=t.ballast_fields.1,
+        t.ballast_size.0..=t.ballast_size.1,
+        t.ballast_locals.0..=t.ballast_locals.1,
+        t.recursion_depth.0..=t.recursion_depth.1,
+        t.dwarf_types.0..=t.dwarf_types.1,
+    )
+        .prop_map(|(ballast_fields, ballast_size, ballast_locals, recursion_depth, dwarf_types)| {
+            FrameShape { ballast_fields, ballast_size, ballast_locals, recursion_depth, dwarf_types }
+        })
+        .boxed()
+}
+
+/// The metamorphic pair: the same program, plus unrelated frame ballast.
+pub fn program_and_shape_strategy() -> BoxedStrategy<(Program, FrameShape)> {
+    (program_strategy(), frame_shape_strategy()).boxed()
 }
 
 fn build_program(ops: Vec<Op>) -> Program {
@@ -200,6 +257,36 @@ mod tests {
                 let l = src.lines().nth((*line as usize) - 1).unwrap();
                 prop_assert!(l.trim().starts_with("std::hint::black_box(());"));
             }
+
+            Ok(())
+        }).unwrap();
+    }
+
+    /// The ballast axis is metamorphic: it must not disturb the observe map or
+    /// the program's own locals, only add state around them.
+    #[test]
+    fn ballast_is_purely_additive() {
+        let mut runner = TestRunner::new(Config { cases: 64, ..Config::default() });
+
+        runner.run(&program_and_shape_strategy(), |(prog, shape)| {
+            let flat = codegen::emit(&prog);
+            let heavy = codegen::emit_with(&prog, &shape);
+
+            prop_assert_eq!(
+                flat.observe_lines.keys().collect::<Vec<_>>(),
+                heavy.observe_lines.keys().collect::<Vec<_>>()
+            );
+
+            let opens = heavy.source.matches('{').count();
+            let closes = heavy.source.matches('}').count();
+            prop_assert_eq!(opens, closes);
+
+            for (_, line) in &heavy.observe_lines {
+                let l = heavy.source.lines().nth((*line as usize) - 1).unwrap();
+                prop_assert!(l.trim().starts_with("std::hint::black_box(());"));
+            }
+
+            prop_assert!(heavy.source.contains("let mut i: i64 = 0i64;"));
 
             Ok(())
         }).unwrap();

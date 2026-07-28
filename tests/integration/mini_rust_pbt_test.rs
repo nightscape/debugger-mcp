@@ -9,6 +9,23 @@
 //!   5. Continue → wait for stop → run oracle::check_snapshot, snapshot-by-snapshot.
 //!   6. Fail with a structured Mismatch report on any divergence.
 //!
+//! Three properties ride on each generated program:
+//!
+//!   * **Ballast invariance** — the generator also picks a `FrameShape`: unrelated
+//!     heavy state (a `&mut self` owning large maps, heavy sibling locals,
+//!     recursion depth, dead DWARF types) added to the frame the observe points
+//!     live in. The program's own locals are untouched by it, so every expected
+//!     value is unchanged by construction. Anything that breaks under ballast is
+//!     the debugger, not the program.
+//!   * **Access-path agreement** — the same scalar read through all five
+//!     documented paths must return the same value. A disagreement, a loud
+//!     failure, and an answer of nothing at all are all violations.
+//!   * **No poisoning** — after each of those reads the session must still
+//!     answer a cheap stack trace and must not have moved to Failed.
+//!
+//! Size tier comes from `MINI_RUST_TIER` (`fast` default, `heavy` for the
+//! expensive end).
+//!
 //! This test is `#[ignore]` because it spawns a real CodeLLDB process.
 //! Run with: `cargo test --test mini_rust_pbt_test -- --ignored --nocapture`
 
@@ -31,12 +48,20 @@ use debugger_mcp::debug::SessionManager;
 use debugger_mcp::mcp::tools::ToolsHandler;
 
 use mini_rust::ast::Program;
+use mini_rust::codegen::FrameShape;
 use mini_rust::interp::Snapshot;
+use mini_rust::value::{PrimValue, Value};
 use mini_rust::{codegen, interp, oracle, strategy};
 
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Budget for one access-path read. Deliberately generous compared to the
+/// adapter's own 4s/8s request timeouts: this asserts that a small scalar is
+/// *readable*, and we want the adapter's timeout to be what fails, with its own
+/// diagnostics, rather than ours firing first and hiding it.
+const PATH_BUDGET: Duration = Duration::from_secs(12);
 
 fn check_prerequisites() -> bool {
     for (cmd, arg) in [("codelldb", "--help"), ("rustc", "--version")] {
@@ -105,8 +130,21 @@ async fn gather_failure_context(
     )
 }
 
-async fn run_one(prog: Program, iter: usize) -> Result<(), String> {
-    let g = codegen::emit(&prog);
+/// The scalars every generated program declares, in the order we prefer to probe
+/// them. Only one is probed per snapshot — five access paths each is already
+/// five round-trips, and rotating through them across snapshots covers all three
+/// primitive types without multiplying the cost per stop.
+fn scalar_to_probe(snap: &Snapshot, idx: usize) -> Option<(&str, PrimValue)> {
+    const NAMES: [&str; 3] = ["i", "b", "s"];
+    let name = NAMES[idx % NAMES.len()];
+    match snap.vars.get(name) {
+        Some(Value::Prim(p)) => Some((name, p.clone())),
+        _ => None,
+    }
+}
+
+async fn run_one(prog: Program, shape: FrameShape, iter: usize) -> Result<(), String> {
+    let g = codegen::emit_with(&prog, &shape);
     let snaps = interp::run(&prog, &g.observe_lines);
 
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
@@ -174,13 +212,32 @@ async fn run_one(prog: Program, iter: usize) -> Result<(), String> {
             ));
         }
 
-        let mismatches = oracle::check_snapshot_via_variables(&tools, &session_id, snap).await;
+        let mut mismatches =
+            oracle::check_snapshot_via_variables(&tools, &session_id, snap).await;
+
+        if let Some((name, expected)) = scalar_to_probe(snap, idx) {
+            mismatches.extend(
+                oracle::check_scalar_all_paths(
+                    &tools, &session_id, name, &expected, PATH_BUDGET,
+                )
+                .await,
+            );
+            mismatches.extend(
+                oracle::check_session_live(
+                    &tools,
+                    &session_id,
+                    &format!("reading `{name}` through all access paths at snap {idx}"),
+                )
+                .await,
+            );
+        }
+
         if !mismatches.is_empty() {
             let ctx = gather_failure_context(&tools, &session_id, &snaps, idx).await;
             let _ = tool_call(&tools, "debugger_disconnect",
                 json!({"sessionId": &session_id}), TOOL_TIMEOUT).await;
             return Err(format!(
-                "snap {idx} at line {}:\n{:#?}\n\n{ctx}\n\n--- source ---\n{}",
+                "snap {idx} at line {} (shape {shape:?}):\n{:#?}\n\n{ctx}\n\n--- source ---\n{}",
                 snap.line, mismatches, g.source,
             ));
         }
@@ -209,10 +266,10 @@ fn pbt_generated_programs() {
     let rt = Runtime::new().unwrap();
     let iter = Cell::new(0usize);
 
-    runner.run(&strategy::program_strategy(), |prog| {
+    runner.run(&strategy::program_and_shape_strategy(), |(prog, shape)| {
         iter.set(iter.get() + 1);
         let this_iter = iter.get();
-        rt.block_on(run_one(prog, this_iter))
+        rt.block_on(run_one(prog, shape, this_iter))
             .map_err(|e| TestCaseError::fail(format!("iter {this_iter}: {e}")))?;
         Ok(())
     }).unwrap();

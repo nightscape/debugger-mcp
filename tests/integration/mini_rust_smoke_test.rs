@@ -218,6 +218,130 @@ fn codegen_compiles_with_rustc() {
     );
 }
 
+fn ballast_shape() -> codegen::FrameShape {
+    codegen::FrameShape {
+        ballast_fields: 4,
+        ballast_size: 16,
+        ballast_locals: 2,
+        recursion_depth: 3,
+        dwarf_types: 5,
+    }
+}
+
+#[test]
+fn flat_shape_is_byte_identical_to_plain_emit() {
+    for prog in [build_demo_program(), build_collections_program()] {
+        let plain = codegen::emit(&prog);
+        let flat = codegen::emit_with(&prog, &codegen::FrameShape::flat());
+        assert_eq!(plain.source, flat.source);
+        assert_eq!(plain.observe_lines, flat.observe_lines);
+    }
+}
+
+#[test]
+fn ballast_shape_preserves_observe_count_and_sentinels() {
+    let prog = build_collections_program();
+    let plain = codegen::emit(&prog);
+    let heavy = codegen::emit_with(&prog, &ballast_shape());
+
+    assert_eq!(
+        plain.observe_lines.keys().collect::<Vec<_>>(),
+        heavy.observe_lines.keys().collect::<Vec<_>>(),
+    );
+
+    for (id, line_num) in &heavy.observe_lines {
+        let line = heavy.source.lines().nth((*line_num as usize) - 1)
+            .expect("line in range");
+        assert!(
+            line.trim().starts_with("std::hint::black_box(());"),
+            "observe {id} expected sentinel at line {line_num}, got: {line:?}"
+        );
+    }
+
+    // The program's own locals stay ordinary frame locals, not struct fields.
+    assert!(heavy.source.contains("let mut v: Vec<i64> = Vec::<i64>::new();"));
+    assert!(heavy.source.contains("fn step(&mut self, depth: usize) {"));
+}
+
+#[test]
+fn ballast_shape_compiles_with_rustc() {
+    if !rustc_available() {
+        eprintln!("skipping: rustc not available");
+        return;
+    }
+
+    let prog = build_collections_program();
+    let g = codegen::emit_with(&prog, &ballast_shape());
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = PathBuf::from(&manifest_dir).join("tests/fixtures/target/mini_rust_smoke");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    // Own subdirectory: concurrent rustc runs clobber each other's temp objects.
+    let out_dir = out_dir.join("ballast");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let src = out_dir.join("ballast.rs");
+    let bin = out_dir.join("ballast");
+    std::fs::write(&src, &g.source).unwrap();
+
+    let result = Command::new("rustc")
+        .arg(&src).arg("-g").arg("-C").arg("opt-level=0")
+        .arg("-o").arg(&bin)
+        .output().unwrap();
+
+    assert!(
+        result.status.success(),
+        "rustc failed:\n--- source ---\n{}\n--- stderr ---\n{}",
+        g.source,
+        String::from_utf8_lossy(&result.stderr),
+    );
+
+    let run = Command::new(&bin).output().unwrap();
+    assert!(run.status.success(), "ballast binary exited: {:?}", run.status);
+}
+
+/// Top of the `heavy` tier. Slow (large DWARF), so it is opt-in via
+/// `cargo test --test mini_rust_smoke_test -- --ignored`.
+#[test]
+#[ignore]
+fn heavy_tier_shape_compiles_with_rustc() {
+    if !rustc_available() {
+        eprintln!("skipping: rustc not available");
+        return;
+    }
+
+    let prog = build_collections_program();
+    let shape = codegen::FrameShape {
+        ballast_fields: 6,
+        ballast_size: 20000,
+        ballast_locals: 3,
+        recursion_depth: 6,
+        dwarf_types: 2000,
+    };
+    let g = codegen::emit_with(&prog, &shape);
+
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let out_dir = PathBuf::from(&manifest_dir).join("tests/fixtures/target/mini_rust_smoke");
+    std::fs::create_dir_all(&out_dir).unwrap();
+
+    let out_dir = out_dir.join("ballast_heavy");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let src = out_dir.join("ballast_heavy.rs");
+    let bin = out_dir.join("ballast_heavy");
+    std::fs::write(&src, &g.source).unwrap();
+
+    let result = Command::new("rustc")
+        .arg(&src).arg("-g").arg("-C").arg("opt-level=0")
+        .arg("-o").arg(&bin)
+        .output().unwrap();
+
+    assert!(
+        result.status.success(),
+        "rustc failed:\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&result.stderr),
+    );
+}
+
 /// Demonstrates that the Value/MapKind/PrimValue types are usable as oracle data.
 #[test]
 fn value_types_compose() {

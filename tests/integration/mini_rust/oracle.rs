@@ -44,6 +44,34 @@ pub enum Mismatch {
     MapValueMismatch { name: String, key: PrimValue, expected: PrimValue, raw: String },
     VarMissing { name: String },
     GetVarsFailed { error: String },
+    /// One documented access path returned a value contradicting the interpreter.
+    AccessPathMismatch {
+        path: String,
+        name: String,
+        expected: PrimValue,
+        raw: String,
+        readings: String,
+    },
+    /// One documented access path failed outright — timeout, adapter-stuck,
+    /// supervisor kill. Diagnosable, but still a violation: reading an in-scope
+    /// scalar must not start failing because heavy state shares the frame.
+    AccessPathFailed {
+        path: String,
+        name: String,
+        detail: String,
+        readings: String,
+    },
+    /// One documented access path returned neither a value nor a specific error
+    /// — `{"empty": true}`, a blank `result` with only a generic `note`, or a
+    /// scope enumeration that simply omitted the variable.
+    AccessPathSilentEmpty {
+        path: String,
+        name: String,
+        detail: String,
+        readings: String,
+    },
+    /// The session stopped answering after an operation.
+    SessionPoisoned { after: String, detail: String },
 }
 
 pub async fn check_snapshot_via_eval(
@@ -579,6 +607,354 @@ fn parse_i64(s: &str) -> Option<i64> {
         .last()
 }
 
+// ============================================================================
+// Access-path agreement oracle
+//
+// Every documented way to read one in-scope scalar must produce the same value,
+// or fail loudly. The bug this pins: some paths answer with nothing at all —
+// `{"empty": true}` or a blank `result` carrying only a generic `note` — which
+// an agent cannot distinguish from "the variable is absent".
+// ============================================================================
+
+/// How a path's raw reading is compared against the expected value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Cmp {
+    /// The reading *is* the rendered value (`3`, `"foo"`, `true`) — strict
+    /// equality via `prim_value_str_matches`.
+    Strict,
+    /// The reading is LLDB `frame variable` output text (`(long) node_id = 3`).
+    /// The `name = value` field is extracted first, then compared strictly; the
+    /// surrounding type prefix and line framing are LLDB's, not ours to pin.
+    FrameVariableText,
+}
+
+#[derive(Debug, PartialEq)]
+enum Reading {
+    Value(String),
+    /// Failed, but with a non-empty specific message — acceptable.
+    LoudFailure(String),
+    /// Neither a value nor a specific error — the violation.
+    SilentEmpty(String),
+}
+
+/// Read one scalar through every documented access path and require agreement.
+///
+/// The contract for a plain scalar that is in scope at the current PC: *every*
+/// documented path must return its correct value within `budget`. Three ways to
+/// break it, all violations, differing only in diagnosability:
+///
+///   * `AccessPathMismatch` — answered, but with the wrong value.
+///   * `AccessPathFailed` — failed loudly (timeout, adapter-stuck, supervisor
+///     kill). Reading a small scalar must not start failing because unrelated
+///     heavy state shares the frame.
+///   * `AccessPathSilentEmpty` — answered nothing, with no error to act on.
+///
+/// `budget` is per tool call and deliberately *not* the shared `EVAL_TIMEOUT`:
+/// under a heavy fixture a slow-but-correct read now fails the property, so the
+/// harness sets the ceiling per tier.
+pub async fn check_scalar_all_paths(
+    tools: &ToolsHandler,
+    session_id: &str,
+    name: &str,
+    expected: &PrimValue,
+    budget: Duration,
+) -> Vec<Mismatch> {
+    let frame_id = match top_frame_id(tools, session_id, budget).await {
+        Ok(f) => f,
+        Err(e) => {
+            return vec![Mismatch::SessionPoisoned {
+                after: format!("resolving top frame to read `{name}`"),
+                detail: e,
+            }]
+        }
+    };
+
+    let readings: Vec<(&str, Cmp, Reading)> = vec![
+        (
+            "get_variables(frameId)",
+            Cmp::Strict,
+            read_scope(tools, session_id, frame_id, name, false, budget).await,
+        ),
+        (
+            "get_variables(frameId, noSynthetic)",
+            Cmp::Strict,
+            read_scope(tools, session_id, frame_id, name, true, budget).await,
+        ),
+        (
+            "evaluate(watch)",
+            Cmp::Strict,
+            read_evaluate(tools, session_id, frame_id, name, "watch", false, budget).await,
+        ),
+        (
+            "evaluate(watch, noSynthetic)",
+            Cmp::Strict,
+            read_evaluate(tools, session_id, frame_id, name, "watch", true, budget).await,
+        ),
+        (
+            "evaluate(repl, `frame variable`)",
+            Cmp::FrameVariableText,
+            read_evaluate(
+                tools,
+                session_id,
+                frame_id,
+                &format!("frame variable {name}"),
+                "repl",
+                false,
+                budget,
+            )
+            .await,
+        ),
+    ];
+
+    verdicts(&readings, name, expected)
+}
+
+/// Pure verdict pass: every reading that is not the correct value is a
+/// violation, carrying the full reading table so a divergence is legible from
+/// any single Mismatch.
+fn verdicts(
+    readings: &[(&str, Cmp, Reading)],
+    name: &str,
+    expected: &PrimValue,
+) -> Vec<Mismatch> {
+    let rendered = render_readings(name, expected, readings);
+    let mut out = Vec::new();
+    for (path, cmp, reading) in readings {
+        match reading {
+            Reading::LoudFailure(detail) => out.push(Mismatch::AccessPathFailed {
+                path: (*path).into(),
+                name: name.into(),
+                detail: detail.clone(),
+                readings: rendered.clone(),
+            }),
+            Reading::SilentEmpty(detail) => out.push(Mismatch::AccessPathSilentEmpty {
+                path: (*path).into(),
+                name: name.into(),
+                detail: detail.clone(),
+                readings: rendered.clone(),
+            }),
+            Reading::Value(raw) => {
+                if !value_matches(*cmp, raw, name, expected) {
+                    out.push(Mismatch::AccessPathMismatch {
+                        path: (*path).into(),
+                        name: name.into(),
+                        expected: expected.clone(),
+                        raw: raw.clone(),
+                        readings: rendered.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// One expensive request must not poison the session: a cheap stack trace and
+/// the session state both have to keep answering afterwards.
+pub async fn check_session_live(
+    tools: &ToolsHandler,
+    session_id: &str,
+    after: &str,
+) -> Vec<Mismatch> {
+    let mut out = Vec::new();
+
+    if let Err(e) = call(
+        tools,
+        "debugger_stack_trace",
+        json!({"sessionId": session_id, "limit": 3}),
+        EVAL_TIMEOUT,
+    )
+    .await
+    {
+        out.push(Mismatch::SessionPoisoned {
+            after: after.into(),
+            detail: format!("debugger_stack_trace: {e}"),
+        });
+    }
+
+    match call(
+        tools,
+        "debugger_session_state",
+        json!({"sessionId": session_id}),
+        EVAL_TIMEOUT,
+    )
+    .await
+    {
+        Ok(v) if v["state"].as_str() == Some("Failed") => out.push(Mismatch::SessionPoisoned {
+            after: after.into(),
+            detail: format!(
+                "session state Failed: {}",
+                v["details"]["error"].as_str().unwrap_or("(no details.error)")
+            ),
+        }),
+        Ok(_) => {}
+        Err(e) => out.push(Mismatch::SessionPoisoned {
+            after: after.into(),
+            detail: format!("debugger_session_state: {e}"),
+        }),
+    }
+
+    out
+}
+
+fn value_matches(cmp: Cmp, raw: &str, name: &str, expected: &PrimValue) -> bool {
+    match cmp {
+        Cmp::Strict => prim_value_str_matches(expected, raw),
+        Cmp::FrameVariableText => match frame_variable_field(raw, name) {
+            Some(v) => prim_value_str_matches(expected, v),
+            None => false,
+        },
+    }
+}
+
+/// Extract `value` from an LLDB `frame variable` line such as
+/// `(long) node_id = 3`. Requires a non-identifier character before `name` so
+/// `other_node_id = 9` cannot answer a query for `node_id`.
+fn frame_variable_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name} = ");
+    text.lines().find_map(|line| {
+        let idx = line.find(&needle)?;
+        let before = line[..idx].chars().next_back();
+        if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+            return None;
+        }
+        // A value with expandable children opens a brace block on the same
+        // line: `(alloc::string::String) s = "init" {`. The summary is what
+        // precedes it.
+        Some(
+            line[idx + needle.len()..]
+                .trim_end()
+                .trim_end_matches('{')
+                .trim_end(),
+        )
+    })
+}
+
+fn render_readings(
+    name: &str,
+    expected: &PrimValue,
+    readings: &[(&str, Cmp, Reading)],
+) -> String {
+    let mut s = format!("readings of `{name}` (expected {expected:?}):\n");
+    for (path, _, r) in readings {
+        let body = match r {
+            Reading::Value(v) => format!("value {v:?}"),
+            Reading::LoudFailure(e) => format!("FAILED: {e}"),
+            Reading::SilentEmpty(d) => format!("SILENT-EMPTY: {d}"),
+        };
+        s.push_str(&format!("  {path:<38} {body}\n"));
+    }
+    s
+}
+
+async fn read_scope(
+    tools: &ToolsHandler,
+    session_id: &str,
+    frame_id: i32,
+    name: &str,
+    no_synthetic: bool,
+    budget: Duration,
+) -> Reading {
+    let args = json!({
+        "sessionId": session_id,
+        "frameId": frame_id,
+        "maxCount": 200,
+        "noSynthetic": no_synthetic,
+    });
+    match call(tools, "debugger_get_variables", args, budget).await {
+        Err(e) => classify_error(&e),
+        Ok(v) => {
+            let vars = v.get("variables").and_then(|x| x.as_array()).cloned().unwrap_or_default();
+            match vars.iter().find(|x| x.get("name").and_then(|n| n.as_str()) == Some(name)) {
+                Some(var) => match var.get("value").and_then(|x| x.as_str()) {
+                    Some(s) if !s.is_empty() => Reading::Value(s.to_string()),
+                    _ => Reading::SilentEmpty(format!("variable row without a value: {var}")),
+                },
+                None => {
+                    let names: Vec<&str> =
+                        vars.iter().filter_map(|x| x.get("name").and_then(|n| n.as_str())).collect();
+                    Reading::SilentEmpty(format!(
+                        "scope enumeration succeeded but omitted `{name}`; saw {names:?}"
+                    ))
+                }
+            }
+        }
+    }
+}
+
+async fn read_evaluate(
+    tools: &ToolsHandler,
+    session_id: &str,
+    frame_id: i32,
+    expression: &str,
+    context: &str,
+    no_synthetic: bool,
+    budget: Duration,
+) -> Reading {
+    let args = json!({
+        "sessionId": session_id,
+        "frameId": frame_id,
+        "expression": expression,
+        "context": context,
+        "noSynthetic": no_synthetic,
+    });
+    match call(tools, "debugger_evaluate", args, budget).await {
+        Err(e) => classify_error(&e),
+        Ok(v) => classify_evaluate(&v),
+    }
+}
+
+/// A failure is acceptable only if it says something specific.
+fn classify_error(err: &str) -> Reading {
+    if err.trim().is_empty() {
+        Reading::SilentEmpty("failed with an empty error message".into())
+    } else {
+        Reading::LoudFailure(err.to_string())
+    }
+}
+
+/// `result` first, then REPL passthrough `output`/`stderr`. Anything else is a
+/// silent nothing — including the explicit `empty: true` marker.
+fn classify_evaluate(resp: &JsonValue) -> Reading {
+    if resp.get("empty").and_then(|e| e.as_bool()) == Some(true) {
+        return Reading::SilentEmpty(format!("responded empty:true — {resp}"));
+    }
+    for field in ["result", "output", "stderr"] {
+        if let Some(s) = resp.get(field).and_then(|v| v.as_str()) {
+            if !s.trim().is_empty() {
+                return Reading::Value(s.to_string());
+            }
+        }
+    }
+    Reading::SilentEmpty(format!("no result, output or stderr — {resp}"))
+}
+
+async fn top_frame_id(
+    tools: &ToolsHandler,
+    session_id: &str,
+    budget: Duration,
+) -> Result<i32, String> {
+    let args = json!({"sessionId": session_id, "format": "json", "limit": 1});
+    let v = call(tools, "debugger_stack_trace", args, budget).await?;
+    v["stackFrames"][0]["id"]
+        .as_i64()
+        .map(|i| i as i32)
+        .ok_or_else(|| format!("stack trace carried no frame id: {v}"))
+}
+
+async fn call(
+    tools: &ToolsHandler,
+    name: &str,
+    args: JsonValue,
+    budget: Duration,
+) -> Result<JsonValue, String> {
+    match timeout(budget, tools.handle_tool(name, args)).await {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("{e}")),
+        Err(_) => Err(format!("{name} timed out after {budget:?}")),
+    }
+}
+
 #[cfg(test)]
 mod parser_tests {
     use super::*;
@@ -623,6 +999,119 @@ mod parser_tests {
         let empty = PrimValue::String(String::new());
         assert!(prim_value_str_matches(&empty, "\"\""));
         assert!(!prim_value_str_matches(&empty, "anything"));
+    }
+
+    #[test]
+    fn silent_empty_responses_are_violations() {
+        // The exact reported shape: in-scope parameter, nothing back.
+        let Reading::SilentEmpty(detail) = classify_evaluate(&json!({"result": "", "empty": true}))
+        else {
+            panic!("`empty: true` must be classified as a violation");
+        };
+        assert!(detail.contains("empty:true"), "{detail}");
+        assert!(matches!(
+            classify_evaluate(&json!({"result": "", "note": "may also indicate a transport drop"})),
+            Reading::SilentEmpty(_)
+        ));
+        assert!(matches!(classify_evaluate(&json!({})), Reading::SilentEmpty(_)));
+        assert!(matches!(classify_error("   "), Reading::SilentEmpty(_)));
+    }
+
+    /// A loud failure is diagnosable, not acceptable: for an in-scope scalar it
+    /// is still a violation, reported separately from the silent-empty case.
+    #[test]
+    fn loud_failures_are_a_distinct_violation() {
+        assert_eq!(
+            classify_error("Evaluate failed: 'node_id' is not a valid command."),
+            Reading::LoudFailure("Evaluate failed: 'node_id' is not a valid command.".into())
+        );
+        assert_eq!(
+            classify_error("debugger_get_variables timed out after 4s"),
+            Reading::LoudFailure("debugger_get_variables timed out after 4s".into())
+        );
+
+        let readings = vec![
+            ("evaluate(watch)", Cmp::Strict, Reading::Value("3".into())),
+            (
+                "get_variables(frameId)",
+                Cmp::Strict,
+                Reading::LoudFailure("variables request timed out after 4s".into()),
+            ),
+            (
+                "evaluate(repl, `frame variable`)",
+                Cmp::FrameVariableText,
+                Reading::SilentEmpty("responded empty:true".into()),
+            ),
+        ];
+        let verdicts = verdicts(&readings, "node_id", &PrimValue::I64(3));
+        assert_eq!(verdicts.len(), 2, "{verdicts:#?}");
+        assert!(matches!(verdicts[0], Mismatch::AccessPathFailed { .. }));
+        assert!(matches!(verdicts[1], Mismatch::AccessPathSilentEmpty { .. }));
+    }
+
+    #[test]
+    fn correct_values_are_accepted() {
+        assert_eq!(
+            classify_evaluate(&json!({"result": "3"})),
+            Reading::Value("3".into())
+        );
+        // REPL passthrough puts the text on `output`, with `result` blank.
+        assert_eq!(
+            classify_evaluate(&json!({"result": "", "output": "(long) node_id = 3\n"})),
+            Reading::Value("(long) node_id = 3\n".into())
+        );
+
+        // All paths agreeing — the only outcome with no verdicts.
+        let readings = vec![
+            ("get_variables(frameId)", Cmp::Strict, Reading::Value("3".into())),
+            ("evaluate(watch)", Cmp::Strict, Reading::Value("3".into())),
+            (
+                "evaluate(repl, `frame variable`)",
+                Cmp::FrameVariableText,
+                Reading::Value("(long) node_id = 3\n".into()),
+            ),
+        ];
+        assert!(verdicts(&readings, "node_id", &PrimValue::I64(3)).is_empty());
+
+        let disagreeing = vec![("evaluate(watch)", Cmp::Strict, Reading::Value("4".into()))];
+        assert!(matches!(
+            verdicts(&disagreeing, "node_id", &PrimValue::I64(3))[0],
+            Mismatch::AccessPathMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn frame_variable_output_yields_the_value() {
+        let out = "(long) node_id = 3\n";
+        assert_eq!(frame_variable_field(out, "node_id"), Some("3"));
+        assert!(value_matches(Cmp::FrameVariableText, out, "node_id", &PrimValue::I64(3)));
+        assert!(!value_matches(Cmp::FrameVariableText, out, "node_id", &PrimValue::I64(4)));
+
+        let multi = "(long) weight = -2\n(unsigned long) current_idx = 1\n";
+        assert_eq!(frame_variable_field(multi, "current_idx"), Some("1"));
+        assert_eq!(frame_variable_field(multi, "weight"), Some("-2"));
+
+        let s = "(alloc::string::String) label = \"foo\"\n";
+        assert!(value_matches(
+            Cmp::FrameVariableText,
+            s,
+            "label",
+            &PrimValue::String("foo".into())
+        ));
+
+        // An expandable value opens its children block on the summary line.
+        let expandable = "(alloc::string::String) s = \"init\" {\n  vec = size=4 {\n  }\n}\n";
+        assert_eq!(frame_variable_field(expandable, "s"), Some("\"init\""));
+        assert!(value_matches(
+            Cmp::FrameVariableText,
+            expandable,
+            "s",
+            &PrimValue::String("init".into())
+        ));
+
+        // A different variable whose name ends in the queried one must not answer.
+        assert_eq!(frame_variable_field("(long) other_node_id = 9\n", "node_id"), None);
+        assert_eq!(frame_variable_field("error: no variable named 'node_id'", "node_id"), None);
     }
 
     #[test]
