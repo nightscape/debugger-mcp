@@ -333,6 +333,32 @@ pub struct GetOutputArgs {
     pub since_line: Option<usize>,
 }
 
+/// Collect the OutputEvents a REPL command produced, once they have stopped
+/// arriving.
+///
+/// LLDB delivers command output as OutputEvents that can land after the
+/// evaluate response, so the drain has to wait for the stream to go quiet
+/// rather than read once at response time.
+async fn drain_repl_output(
+    session: &crate::debug::session::DebugSession,
+    since: usize,
+) -> Vec<crate::debug::session::OutputEntry> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(40);
+    const IDLE_POLLS: u32 = 2;
+    const CAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    let deadline = std::time::Instant::now() + CAP;
+    let mut last = session.current_output_line();
+    let mut idle = 0;
+    while idle < IDLE_POLLS && std::time::Instant::now() < deadline {
+        tokio::time::sleep(POLL).await;
+        let now = session.current_output_line();
+        idle = if now == last { idle + 1 } else { 0 };
+        last = now;
+    }
+    session.get_output_from(since, 1000).await
+}
+
 fn is_bare_identifier(expr: &str) -> bool {
     let trimmed = expr.trim();
     !trimmed.is_empty() && trimmed.chars().all(|c| c.is_alphanumeric() || c == '_')
@@ -1038,6 +1064,7 @@ impl ToolsHandler {
             && is_bare_identifier(&args.expression);
         let is_repl = context_str == "repl";
 
+
         // Snapshot output line counter so we can attribute LLDB stdout/stderr
         // emitted *during* this evaluate to the response. Without this, REPL
         // commands like `frame variable`, `version`, `help` look identical to
@@ -1070,7 +1097,7 @@ impl ToolsHandler {
                     // routes LLDB command output; "stderr" carries error text.
                     // Both are surfaced — the caller decides what to do with
                     // them.
-                    let entries = session.get_output(None, None, 1000, Some(since)).await;
+                    let entries = drain_repl_output(&session, since).await;
                     let mut combined = String::new();
                     let mut stderr_buf = String::new();
                     for e in &entries {
@@ -1130,6 +1157,23 @@ impl ToolsHandler {
                         context_str,
                     );
                     return Err(Error::AdapterStuck(format!("{err_str}{retry}")));
+                }
+                // `context: "repl"` feeds the expression to LLDB's *command*
+                // interpreter, so a variable name comes back as an unknown
+                // command. Only LLDB can tell a variable name apart from a
+                // command it happens to resemble (`version`, `help`, `bt`), so
+                // react to its verdict rather than pre-screening the syntax.
+                if is_repl
+                    && is_bare_identifier(&args.expression)
+                    && err_str.contains("is not a valid command")
+                {
+                    let name = args.expression.trim();
+                    return Err(Error::InvalidRequest(format!(
+                        "`{name}` is not an LLDB command. To read it as a variable, either \
+                         debugger_evaluate({{sessionId, expression: \"{name}\", \
+                         context: \"watch\"}}), or stay in the REPL with \
+                         expression: \"frame variable {name}\"."
+                    )));
                 }
                 Err(e)
             }
@@ -1636,7 +1680,13 @@ impl ToolsHandler {
         let filter = args.filter.as_deref();
 
         let variables = if let Some(var_ref) = args.variables_reference {
-            session.get_variable_children(var_ref, filter, max_count, args.no_synthetic).await
+            session
+                .get_variable_children(var_ref, filter, max_count, args.no_synthetic)
+                .await
+                .map(|variables| crate::debug::session::ScopeVariables {
+                    variables,
+                    synthetics_disabled: false,
+                })
         } else {
             // Resolve frame_id: use provided, or auto-fetch from stopped thread
             let frame_id = if let Some(fid) = args.frame_id {
@@ -1648,14 +1698,12 @@ impl ToolsHandler {
                 }
                 frames[0].id
             };
-            // The scope-level call only returns top-level locals (name/type/
-            // varRef), never their children — synthetic providers don't
-            // activate at this level, so `no_synthetic` would be a no-op.
-            session.get_scope_variables(frame_id, args.scope.as_deref(), max_count).await
+            session.get_scope_variables(frame_id, args.scope.as_deref(), max_count, args.no_synthetic).await
         };
 
         match variables {
-            Ok(vars) => {
+            Ok(scope_vars) => {
+                let vars = scope_vars.variables;
                 let truncated = vars.len() == max_count as usize;
                 let has_expandable = vars.iter().any(|v| v.variables_reference > 0);
                 let json_vars: Vec<Value> = vars.iter().map(|v| {
@@ -1675,6 +1723,16 @@ impl ToolsHandler {
                 });
                 if has_expandable {
                     result["hint"] = json!("Use variablesReference with this tool to drill into expandable variables");
+                }
+                if scope_vars.synthetics_disabled {
+                    result["syntheticsDisabled"] = json!(true);
+                    result["hint"] = json!(
+                        "LLDB's synthetic value providers were disabled for this read because the \
+                         pretty summary walk was too expensive for this frame. The `value` column \
+                         shows raw struct shape (a HashMap renders as its raw field count, e.g. \
+                         `size=1`); names, types and variablesReference are unaffected. Drill into \
+                         a specific variablesReference with this tool to get the pretty view back."
+                    );
                 }
                 // Empty-locals signal: when called for a frame's locals scope
                 // (no variablesReference) and we got back nothing, it's almost

@@ -1605,15 +1605,24 @@ impl DapClient {
         // kill the adapter. Override with DAP_VARIABLES_TIMEOUT_MS for large
         // Rust binaries where DWARF lookups are slow.
         let timeout = super::timeouts::variables_limited();
+        // `AdapterStuck` carries the responsive-vs-wedged classification and the
+        // matching recovery advice, and maps to JSON-RPC -32009. Keep the
+        // variant and add context to its message; flattening it to `Dap` here
+        // costs the caller both.
         let response = self
             .send_request_with_timeout("variables", Some(serde_json::to_value(args)?), timeout)
             .await
-            .map_err(|e| Error::Dap(format!(
-                "variables request timed out after {timeout:?} (variablesReference={variables_reference}). \
-                 This often happens with large or deeply nested types (e.g. HashMap, Vec with many elements). \
-                 Pass `noSynthetic: true` to bypass synthetic providers, or evaluate a specific field instead. \
-                 Original error: {e}"
-            )))?;
+            .map_err(|e| {
+                let context = format!(
+                    "variables request on variablesReference={variables_reference} failed. \
+                     Large or deeply nested types (HashMap, Vec with many elements) are the \
+                     usual cause; evaluate a specific field instead of the container. "
+                );
+                match e {
+                    Error::AdapterStuck(msg) => Error::AdapterStuck(format!("{context}{msg}")),
+                    other => Error::Dap(format!("{context}Original error: {other}")),
+                }
+            })?;
 
         if !response.success {
             return Err(Error::Dap(format!(

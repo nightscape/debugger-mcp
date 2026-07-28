@@ -121,6 +121,20 @@ pub(crate) struct VarCacheEntry {
     /// Expression path from a frame-visible root, e.g. `state.c[0]`. Usable
     /// directly as the `expression` argument to `evaluate`.
     pub path: String,
+    /// True when this reference was handed out while LLDB's synthetic values
+    /// were disabled. Such a reference is bound to the raw SBValue, so drilling
+    /// into it yields struct internals (`buf`, `len`) instead of `[0]`, `[1]`, …
+    /// even after the setting is restored. Re-resolve via `evaluate` to get the
+    /// pretty view back.
+    pub raw_bound: bool,
+}
+
+/// Result of a scope-level variable enumeration. `synthetics_disabled` tells the
+/// caller the `value` column shows raw struct shape rather than a pretty summary,
+/// because LLDB's synthetic providers had to be switched off to answer at all.
+pub struct ScopeVariables {
+    pub variables: Vec<Variable>,
+    pub synthetics_disabled: bool,
 }
 
 pub struct DebugSession {
@@ -1328,12 +1342,21 @@ impl DebugSession {
     /// Fetch raw variables from a scope, without child expansion.
     /// `scope_name`: if Some, find scope by name (case-insensitive); otherwise pick first non-expensive scope.
     /// If all scopes are expensive, falls back to the first scope (max_count protects us).
+    ///
+    /// On LLDB this always runs with synthetic values off. CodeLLDB computes a
+    /// summary string per Variable and those summaries walk each container's
+    /// synthetic provider; on a frame owning several large maps that enumeration
+    /// costs 5.06s and 628MB RSS (supervisor kill) versus 24ms with
+    /// `target.enable-synthetic-value false`. It cannot be attempted-then-retried:
+    /// LLDB does not abort a walk already in progress on DAP cancel, so the
+    /// follow-up `settings set` wedges behind it while RSS keeps climbing.
     pub async fn get_scope_variables(
         &self,
         frame_id: i32,
         scope_name: Option<&str>,
         max_count: i32,
-    ) -> Result<Vec<crate::dap::types::Variable>> {
+        no_synthetic: bool,
+    ) -> Result<ScopeVariables> {
         let mut scopes = self.scopes(frame_id).await?;
         if scopes.is_empty() {
             return Err(crate::Error::Dap("No scopes available for this frame".to_string()));
@@ -1356,7 +1379,72 @@ impl DebugSession {
         };
 
         let max_count = max_count.min(200);
-        self.get_variable_children(scope.variables_reference, None, max_count, false).await
+        let var_ref = scope.variables_reference;
+
+        if !self.uses_lldb() {
+            let variables = self
+                .get_variable_children(var_ref, None, max_count, no_synthetic)
+                .await?;
+            return Ok(ScopeVariables { variables, synthetics_disabled: false });
+        }
+
+        let variables = self.fetch_scope_without_synthetics(frame_id, var_ref, max_count).await?;
+        Ok(ScopeVariables { variables, synthetics_disabled: true })
+    }
+
+    fn uses_lldb(&self) -> bool {
+        self.language == "rust"
+    }
+
+    /// Frame id of the stopped thread's top frame. `evaluate` without one is
+    /// resolved by the adapter against thread 0, which CodeLLDB rejects as an
+    /// invalid thread id — the expression then fails to resolve any local.
+    async fn top_frame_id(&self) -> Result<i32> {
+        let thread_id = match &self.state.read().await.state {
+            DebugState::Stopped { thread_id, .. } => *thread_id,
+            _ => {
+                return Err(crate::Error::InvalidState(
+                    "Cannot resolve a frame: session is not stopped".to_string(),
+                ))
+            }
+        };
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        let frames = client.stack_trace(thread_id, Some(1)).await?;
+        frames
+            .first()
+            .map(|f| f.id)
+            .ok_or_else(|| crate::Error::Dap(format!("No stack frames on thread {thread_id}")))
+    }
+
+    /// Enumerate a scope with LLDB's synthetic providers switched off, then
+    /// switch them back on — the setting is target-global, so leaving it off
+    /// would silently degrade every later drill in the session.
+    async fn fetch_scope_without_synthetics(
+        &self,
+        frame_id: i32,
+        var_ref: i32,
+        max_count: i32,
+    ) -> Result<Vec<Variable>> {
+        self.set_lldb_synthetic_values(frame_id, false).await?;
+        let fetched = self
+            .fetch_children_and_cache(var_ref, None, None, max_count, true, true)
+            .await;
+        self.set_lldb_synthetic_values(frame_id, true).await?;
+        fetched
+    }
+
+    async fn set_lldb_synthetic_values(&self, frame_id: i32, enabled: bool) -> Result<()> {
+        let client_arc = self.get_debug_client().await;
+        let client = client_arc.read().await;
+        client
+            .evaluate_raw(
+                &format!("settings set target.enable-synthetic-value {enabled}"),
+                Some(frame_id),
+                Some("repl".to_string()),
+            )
+            .await?;
+        Ok(())
     }
 
     /// Fetch children of a variablesReference, with optional filter and count limit.
@@ -1400,6 +1488,21 @@ impl DebugSession {
                         entry.path.clone(),
                         filter,
                         max_count,
+                        true,
+                    ).await;
+                }
+                if entry.raw_bound {
+                    info!(
+                        "🔁 re-resolving raw-bound var_ref={} through evaluate(\"{}\") \
+                         to restore the synthetic child view",
+                        variables_reference, entry.path,
+                    );
+                    return self.fetch_children_via_evaluate(
+                        variables_reference,
+                        entry.path.clone(),
+                        filter,
+                        max_count,
+                        false,
                     ).await;
                 }
             }
@@ -1414,6 +1517,7 @@ impl DebugSession {
             filter,
             max_count,
             no_synthetic,
+            false,
         ).await
     }
 
@@ -1426,17 +1530,17 @@ impl DebugSession {
         filter: Option<&str>,
         max_count: i32,
         no_synthetic: bool,
+        raw_bound: bool,
     ) -> Result<Vec<Variable>> {
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
 
-        let timeout = std::time::Duration::from_secs(5);
-        let variables = tokio::time::timeout(
-            timeout,
-            client.variables_limited(variables_reference, Some(max_count), filter, no_synthetic),
-        )
-        .await
-        .map_err(|_| crate::Error::Dap("Timeout fetching variables".to_string()))??;
+        // No outer timeout: `variables_limited` already bounds itself and its
+        // error carries the responsive-vs-wedged classification, which a second
+        // guard on top would replace with a bare timeout message.
+        let variables = client
+            .variables_limited(variables_reference, Some(max_count), filter, no_synthetic)
+            .await?;
 
         // Client-side truncation: CodeLLDB ignores the count parameter.
         let variables: Vec<Variable> =
@@ -1461,6 +1565,7 @@ impl DebugSession {
                     cache.insert(v.variables_reference, VarCacheEntry {
                         type_name: v.type_.clone().unwrap_or_default(),
                         path,
+                        raw_bound,
                     });
                 }
             }
@@ -1469,45 +1574,49 @@ impl DebugSession {
         Ok(variables)
     }
 
-    /// Internal: route a drill through `evaluate("?path", context: "watch")`
-    /// to bypass CodeLLDB's synthetic walk. Used when the cache identifies
-    /// the drill target as a state-machine type. Re-wraps the evaluate
-    /// response's children as if they came from a `variables` request and
-    /// re-populates the cache so further drills on those children also work.
+    /// Internal: route a drill through `evaluate(path, context: "watch")`,
+    /// which re-resolves the target from its source-level expression instead of
+    /// the stored SBValue. With `raw` the expression is prefixed with `?` to
+    /// bypass CodeLLDB's synthetic walk (state-machine drills); without it the
+    /// evaluate returns a fresh synthetic-backed reference (raw-bound drills).
+    /// Re-wraps the response's children as if they came from a `variables`
+    /// request and re-populates the cache so further drills also work.
     ///
-    /// Falls back to a `no_synthetic=true` variables request on the original
-    /// var_ref if evaluate can't resolve the path — happens for paths that
-    /// are valid at-cache-write time but stop being addressable at drill time
-    /// (e.g. a captured local that's been moved by codegen, or an LLDB
-    /// synthetic with a name that looks like an identifier but isn't one).
+    /// Falls back to a variables request on the original var_ref if evaluate
+    /// can't resolve the path — happens for paths that are valid at-cache-write
+    /// time but stop being addressable at drill time (e.g. a captured local
+    /// that's been moved by codegen, or an LLDB synthetic with a name that
+    /// looks like an identifier but isn't one).
     async fn fetch_children_via_evaluate(
         &self,
         original_var_ref: i32,
         path: String,
         filter: Option<&str>,
         max_count: i32,
+        raw: bool,
     ) -> Result<Vec<Variable>> {
+        let frame_id = self.top_frame_id().await?;
         let client_arc = self.get_debug_client().await;
         let client = client_arc.read().await;
-        let expr = format!("?{path}");
+        let expr = if raw { format!("?{path}") } else { path.clone() };
 
         let eval_result = client
-            .evaluate_raw(&expr, None, Some("watch".to_string()))
+            .evaluate_raw(&expr, Some(frame_id), Some("watch".to_string()))
             .await;
         drop(client);
 
         match eval_result {
-            Ok((_, raw_view_ref)) if raw_view_ref > 0 => {
-                // Drill into the raw view returned by evaluate. We synthesize
-                // a parent_path matching the evaluate expression — that lets
-                // nested drills keep routing through evaluate if they hit
-                // another state-machine type.
+            Ok((_, view_ref)) if view_ref > 0 => {
+                // We synthesize a parent_path matching the evaluate expression
+                // — that lets nested drills keep routing through evaluate if
+                // they hit another state-machine type.
                 self.fetch_children_and_cache(
-                    raw_view_ref,
+                    view_ref,
                     Some(path),
                     filter,
                     max_count,
-                    true, // already in raw view; keep synthetic off for safety
+                    raw,
+                    false,
                 ).await
             }
             Ok((_, _)) => {
@@ -1522,15 +1631,16 @@ impl DebugSession {
                 // so this may still hit the synthetic walk — but it's the
                 // best we can do without losing the call entirely.
                 warn!(
-                    "evaluate('?{path}') failed ({e}); falling back to \
-                     variables(no_synthetic=true) on var_ref={original_var_ref}"
+                    "evaluate('{expr}') failed ({e}); falling back to \
+                     variables on var_ref={original_var_ref}"
                 );
                 self.fetch_children_and_cache(
                     original_var_ref,
                     Some(path),
                     filter,
                     max_count,
-                    true,
+                    raw,
+                    false,
                 ).await
             }
         }
@@ -1556,7 +1666,7 @@ impl DebugSession {
             Some(s) => s,
             None => {
                 warn!("All scopes are expensive, using first scope with count limit");
-                return self.get_scope_variables(frame_id, None, 20).await;
+                return Ok(self.get_scope_variables(frame_id, None, 20, true).await?.variables);
             }
         };
 
@@ -1584,6 +1694,7 @@ impl DebugSession {
             None,
             30,
             true,
+            false,
         ).await?;
 
         let client_arc = self.get_debug_client().await;
@@ -1716,10 +1827,25 @@ impl DebugSession {
             .collect()
     }
 
-    /// Snapshot the current output line counter. Pass the returned value as
-    /// `since_line` to `get_output` to fetch only entries produced *after* the
-    /// snapshot — used by `debugger_evaluate(context: "repl")` to attribute
-    /// LLDB stdout/stderr to a specific REPL command.
+    /// Entries from `from_line` onwards, inclusive.
+    ///
+    /// Pairs with `current_output_line`, which reports the line number the next
+    /// entry will receive. `get_output`'s `since_line` is exclusive and expects
+    /// a line number already seen, which is the wrong end for that snapshot.
+    pub async fn get_output_from(&self, from_line: usize, limit: usize) -> Vec<OutputEntry> {
+        let buffer = self.output_buffer.read().await;
+        buffer
+            .iter()
+            .filter(|e| e.line_number >= from_line)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// Snapshot the output line counter: the line number the next entry will
+    /// get. Pass it to `get_output_from` to collect everything a subsequent
+    /// command produces — used by `debugger_evaluate(context: "repl")` to
+    /// attribute LLDB stdout/stderr to a specific REPL command.
     pub fn current_output_line(&self) -> usize {
         self.output_line_counter.load(Ordering::Relaxed)
     }
